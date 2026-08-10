@@ -1,0 +1,17 @@
+# 运行时生成数据
+data/
+data2/
+
+# Python
+__pycache__/
+.venv/
+
+# uv
+uv.lock
+
+# IDE
+.vscode/
+
+# 临时文件
+~$*
+*.tmp

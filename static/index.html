@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LanChat - 局域网通讯</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 顶栏 -->
+<header id="topbar">
+  <span class="logo">🔗 LanChat</span>
+  <div class="user-info">
+    <span id="my-name-label"></span>
+    <span id="my-ip-label"></span>
+    <span id="my-network-label"></span>
+    <button id="btn-edit-name" title="修改昵称">✏️</button>
+  </div>
+</header>
+
+<!-- 主体 -->
+<div id="main-container">
+
+  <!-- 左侧边栏 -->
+  <aside id="sidebar">
+
+    <!-- 在线用户列表 -->
+    <section class="panel" id="panel-online">
+      <div class="panel-header">
+        <span>在线用户</span>
+        <span class="badge" id="online-count">0</span>
+        <button id="btn-scan" class="btn-sm">🔍 扫描</button>
+      </div>
+      <div class="panel-list" id="online-list">
+        <div class="empty-hint">暂无在线用户</div>
+      </div>
+    </section>
+
+    <!-- 连接请求列表（有待处理请求时显示） -->
+    <section class="panel" id="panel-pending" style="display:none">
+      <div class="panel-header pending-header">
+        <span>连接请求</span>
+        <span class="badge badge-pending" id="pending-count">0</span>
+      </div>
+      <div class="panel-list" id="pending-list"></div>
+    </section>
+
+    <!-- 历史联系人列表 -->
+    <section class="panel" id="panel-contacts">
+      <div class="panel-header">
+        <span>历史联系人</span>
+        <span class="badge" id="contacts-count">0</span>
+      </div>
+      <div class="panel-list" id="contacts-list">
+        <div class="empty-hint">暂无历史联系人</div>
+      </div>
+    </section>
+
+  </aside>
+
+  <!-- 右侧聊天区域 -->
+  <main id="chat-area">
+    <div id="chat-placeholder" class="chat-placeholder">
+      <div class="placeholder-icon">💬</div>
+      <p>选择一个用户开始聊天</p>
+      <p class="sub">左侧在线用户列表可以看到当前局域网内可用的好友</p>
+    </div>
+
+    <!-- 聊天内容容器（选中用户后显示） -->
+    <div id="chat-container" style="display:none">
+      <div id="chat-header">
+        <span id="chat-peer-name"></span>
+        <span id="chat-peer-status"></span>
+        <button id="btn-close-chat" class="btn-sm" title="关闭聊天">✕</button>
+        <button id="btn-delete-contact" class="btn-sm btn-danger" title="删除联系人">🗑</button>
+      </div>
+      <div id="chat-messages"></div>
+      <div id="chat-input-area">
+        <input type="file" id="file-input" style="display:none">
+        <button id="btn-send-file" class="btn-sm" title="发送文件">📎</button>
+        <input type="text" id="msg-input" placeholder="输入消息..." autocomplete="off">
+        <button id="btn-send" class="btn-primary">发送</button>
+      </div>
+    </div>
+  </main>
+
+</div>
+
+<!-- 昵称编辑弹窗 -->
+<div id="modal-overlay" style="display:none">
+  <div class="modal">
+    <h3>修改昵称</h3>
+    <input type="text" id="modal-name-input" placeholder="输入新昵称" maxlength="32">
+    <div class="modal-buttons">
+      <button id="btn-modal-cancel">取消</button>
+      <button id="btn-modal-save" class="btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 文件传输弹窗 -->
+<div id="file-modal-overlay" style="display:none">
+  <div class="modal">
+    <h3 id="file-modal-title"></h3>
+    <div id="file-modal-body"></div>
+    <div class="modal-buttons" id="file-modal-buttons"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

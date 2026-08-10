@@ -1,0 +1,10 @@
+[project]
+name = "internproject"
+version = "0.1.0"
+description = "版本一实现：根据architecture进行代码实现，能够实现用户发现、通信、文件传输等功能，详见.session"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+]
