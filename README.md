@@ -13,7 +13,7 @@
 
 ```bash
 # 克隆项目
-git clone <your-gitee-repo-url>
+git clone https://github.com/meantrick11/lanchat-p2p
 cd internproject
 
 # 安装依赖
