@@ -126,7 +126,9 @@
 
 **决定**：
 - FastAPI 绑定 `0.0.0.0`，监听所有网卡接口
-- UDP 遍历所有活跃网卡，每个子网各发一份广播
+- UDP 遍历所有活跃网卡，每张网卡发出的广播包携带**该网卡自己的 IP**（非全局单一 IP），保证接收方拿到的地址在同子网内可达
+- Linux 通过 ioctl 获取网卡 IP + 子网掩码；Windows 通过 `ipconfig` 解析（适配中英文系统），必要时 `getaddrinfo` 兜底
+- 网卡枚举结果缓存 60 秒
 - UDP 监听绑定 `0.0.0.0`，可收到所有网卡回复
 - 只支持同子网发现，不跨路由器
 
@@ -134,7 +136,13 @@
 
 ## 16. 跨子网需要支持吗？
 
-**决定**：不需要。只根据当前获得的 IP 和子网掩码锁定当前网段下的用户。UDP 广播无法跨路由器。
+**决定**：基本范围仍是同子网，但增加了**手动 IP 连接 + 自动 HTTP 探活**作为补充。
+
+- **发现**：UDP 广播只覆盖同子网，跨子网需手动输入 IP:端口
+- **验证**：跨子网时 UDP peer_list 没有对方记录 → HTTP GET `/api/me` 反向验证 token
+- **持久化**：联系人存储 `ws_port`，重启后通过定期 HTTP 探活（每 30 秒）自动发现上线状态
+- **续活**：HTTP 探活成功刷新 `last_seen`，防止 UDP 超时机制（16s）误踢跨子网节点
+- **限制**：需 TCP 可达，需知道对方 IP:端口，首次仍需手动输入
 
 ---
 
@@ -185,6 +193,101 @@
 | 程序退出 | 发 goodbye 广播 → 关闭所有 WS → 保存配置 |
 | IP 变化 | 定时检测，变化后重新初始化 discovery |
 | 双方同时发起连接 | 各自建立一条 WS，合并到同一聊天窗口 |
-| 删除联系人 | 右键删除，同时清除聊天记录 |
+| 删除联系人 | 点击聊天头部 🗑 按钮删除，同时清除聊天记录和后端存储 |
 | 拒绝连接后 | A 显示"对方拒绝了连接"，可再次发起 |
 | 表现形式 | WebUI（浏览器打开即用，易演示） |
+
+---
+
+## 22. 同机多实例 UUID 如何区分？
+
+**决定**：UUID 格式为 `{base_uuid}_{WS_PORT}`。`base_uuid` 从 `config.json` 读取（同机共享），端口后缀确保多实例唯一。
+
+**原因**：同机多实例共享 `data/config.json`，纯 base_uuid 会导致互把对方当"自己"忽略。端口天然唯一，无需额外配置。
+
+---
+
+## 23. 手动连接 UI 如何设计？
+
+**决定**：在线列表标题栏 `➕` 按钮，点击展开紧凑输入行（IP:端口 + 连接按钮），再次点击收起。
+
+**原因**：手动连接使用频率不高，独立面板浪费空间。toggle 展开保持侧栏整洁。
+
+---
+
+## 24. 如何防止用户连接到自己的实例？
+
+**决定**：前后端双重检查。
+- 前端 `connectByIp()`：`ip === myInfo.ip && port === myInfo.ws_port` → 拒绝
+- 后端 `ws_chat`：`peer_uuid == MY_UUID` → 返回 `connect_rejected: self_connect`
+- 前端渲染层：在线列表、历史联系人、peer_online 回调均过滤 `myInfo.uuid`
+
+---
+
+## 25. 跨子网 Token 验证失败怎么办？
+
+**决定**：UDP peer_list 验证优先 → 失败则 HTTP GET `/api/me` 反向验证 → 仍失败则拒绝连接。
+
+**实现**：`_verify_token_via_api()` 用 `asyncio.to_thread` + `urllib.request`（stdlib，无需新依赖），超时 3 秒。
+
+---
+
+## 26. 联系人存储是否需要端口信息？
+
+**决定**：需要。`contacts.json` 每条记录增加 `ws_port` 字段，默认 50002。
+
+**原因**：跨子网 HTTP 探活需要知道对方监听端口。同子网可通过 UDP 广播获取端口，跨子网必须持久化。
+
+---
+
+## 27. 断开连接如何设计？
+
+**决定**：聊天头部新增「断开」按钮，单方面断开即可，无需对方确认。
+
+**流程**：
+- 点击断开 → 关闭本方 outgoing chat WS + 通知后端关闭 incoming chat WS
+- 后端关闭对端 WS → 对端 ws_chat finally 发送 `peer_disconnected` → 对端浏览器收到通知
+- 双方 UI 同步更新为"在线（未连接）"
+
+**原因**：聊天是双方自愿的，任何一方都有权随时终止。类比挂电话不需要对方同意。
+
+---
+
+## 28. 删除联系人时是否需要断开底层 WS？
+
+**决定**：需要。删除联系人时应先断开 WS 连接再删除数据。
+
+**问题**：之前的 `deleteCurrentContact()` 只删除 `contacts.json` 和内存数据，底层 WS 连接未关闭，导致双方侧边栏仍然显示"已连接"，产生"幽灵连接"。
+
+**修复**：删除前先检查 `activeChats` 和 `connectedPeers`，有则先关闭 WS + 通知后端，清理 `pendingFileTransfers`，再删除联系人数据。
+
+---
+
+## 29. 文件发送回退路径（Path 2）如何处理？
+
+**决定**：当发送方没有直接 chat WS 时（被动接收方发文件），通过**后端 HTTP relay** 替代原来的 chat WS 直发。
+
+**问题**：原来的 Path 2（control WS → 后端 → chat WS → 对端前端）有两个缺陷：
+1. 对端前端的 `setupPeerMessageHandler` 没有处理 `file_request` 类型 → 消息被静默丢弃
+2. 对端接受后，`_handle_file_response` 中 `active_chats.get(sender_uuid)` 为 None → 响应无法传回
+
+**修复**：
+- 新增 `POST /api/transfer/request` 端点：接收其他后端的文件传输 relay，创建 transfer + 通知自己浏览器
+- `_handle_file_request_from_browser`：优先 HTTP POST 到对端后端，失败则回退到 chat WS 直发
+- `_handle_file_response`：`peer_ws` 为空时，通过 `forward_file_response` 通知浏览器经 chat WS 转发
+- 前端 `handleForwardFileResponse()`：收到转发指令后通过本方 chat WS 发送 `file_response`
+- 前端 `setupPeerMessageHandler`：新增 `file_request` 处理作为 HTTP relay 失败的 fallback
+- 后端新增 `register_transfer` 控制消息：前端收到 chat WS file_request 后注册 transfer
+
+---
+
+## 30. 聊天消息溢出时如何滚动？
+
+**决定**：使用 flex 布局 + `overflow-y: auto` 实现消息区独立滚动。
+
+**问题**：flex 子元素（`#chat-messages` 和 `#chat-container`）的隐式 `min-height: auto` 导致容器随内容撑高，`overflow-y: auto` 永不触发。消息超出窗口时先向上挤压覆盖，发很多条后才"反应"出现滚动条。
+
+**修复**：
+- `#chat-container` 和 `#chat-messages` 均设置 `min-height: 0`
+- `#chat-messages > .msg` 设置 `flex-shrink: 0`，防止 flex 压缩消息导致文件气泡消失
+- JS 中 `scrollTop` 改用 `requestAnimationFrame` 回调，等 flex 重排完成后再滚动到底部

@@ -152,7 +152,7 @@ internproject/
 ### 7.2 用户名与 UUID
 
 - **用户名（昵称）**：默认取主机名 `socket.gethostname()`，用户可在页面右上角随时修改，保存到 `config.json`
-- **UUID**：首次启动时通过 `uuid4()` 自动生成并持久化到 `config.json`，后续启动复用同一个 UUID
+- **UUID**：首次启动时通过 `uuid4()` 自动生成并持久化到 `config.json`，格式为 `{base_uuid}_{WS_PORT}`，端口后缀确保同机多实例 UUID 唯一
 - **UUID 复用原因**：让其他节点重启后仍能认出你是同一个人，避免历史联系人、聊天记录对不上号
 - 用户名可重名（如两台电脑都叫 DESKTOP-ABC），UUID 全局唯一，因此 UUID 用于后端身份识别，用户名仅用于前端展示
 
@@ -378,8 +378,8 @@ A 重启 → 浏览器端传输队列丢失 → 无法自动续传
  "ws_port":50002, "token":"abc123...", "timestamp":1691670000.0}
 
 # ===== WebSocket 连接建立 =====
-请求:  {"type":"connect_request", "uuid":"...", "name":"...", "token":"...", "ip":"..."}
-同意:  {"type":"connect_accepted"}
+请求:  {"type":"connect_request", "uuid":"...", "name":"...", "token":"...", "ip":"...", "ws_port":50002}
+同意:  {"type":"connect_accepted", "uuid":"...", "name":"...", "ip":"...", "ws_port":50002}
 拒绝:  {"type":"connect_rejected", "reason":"user_declined"}
 
 # ===== WebSocket 聊天 =====
@@ -468,15 +468,69 @@ A 点"取消传输":
 ### 9.5 多网卡处理
 
 - **FastAPI/HTTP 服务**：绑定 `0.0.0.0`，监听所有网卡接口
-- **UDP 广播**：遍历所有活跃网卡，每个子网各发一份广播
+- **UDP 广播**：遍历所有活跃网卡，每个子网各发一份广播，**每张网卡的广播包携带该网卡自己的 IP**（而非全局单一 IP）
 
 ```
-网卡1(WiFi): 192.168.1.100/24 → 广播到 192.168.1.255
-网卡2(有线):  10.0.0.50/8     → 广播到 10.0.0.255
+网卡1(WiFi): 192.168.1.100/24 → 广播到 192.168.1.255, ip=192.168.1.100
+网卡2(有线):  10.0.0.50/8     → 广播到 10.255.255.255, ip=10.0.0.50
 ```
 
 - UDP 监听绑定 `0.0.0.0`，可收到来自所有网卡的广播回复
 - 只支持同子网发现，不跨路由器
+- 网卡枚举结果缓存 60 秒，避免频繁调用系统命令
+
+### 9.7 跨子网手动连接与自动探活
+
+跨子网（如物理机与虚拟机 Host-Only 网段）UDP 广播无法到达，但 TCP 可达。提供手动 IP 连接 + 自动 HTTP 探活机制。
+
+#### 手动连接
+- 在线列表标题栏 `➕` 按钮 → 展开 IP:端口输入行 → 输入目标地址 → 直接 WebSocket 连接
+- 无需对方在 UDP 在线列表中
+
+#### 跨子网 Token 验证
+- 同子网：UDP 广播分发的 token 直接验证
+- 跨子网兜底：HTTP GET 发起方 `/api/me` → 对比返回的 token → 通过则临时写入 peer_list
+
+```
+A（发起方，跨子网）→ B：
+  ① A 浏览器 → WS 连接 B 的 /ws/chat
+  ② 发送 connect_request {uuid, token, ip, ws_port}
+  ③ B 查 peer_list：找不到 A 的 UUID（UDP 未覆盖）
+  ④ B HTTP GET http://A_IP:A_PORT/api/me → 返回 {uuid, token}
+  ⑤ 对比通过 → A 写入 peer_list → 通知 B 浏览器 incoming_connection
+  ⑥ B 同意 → 连接建立
+```
+
+#### 定期 HTTP 探活
+- 后台每 30 秒对所有不在 UDP 列表中的历史联系人发起 HTTP GET `/api/me`
+- 成功 → 刷新 `last_seen` 阻止超时标记离线，首次发现则通知前端上线
+- 失败 → 不处理，由 UDP 超时机制（16s）自然标记离线
+- 联系人存储 `ws_port` 字段，用于探活时知道对方监听端口
+
+#### 联系人存储 ws_port
+`contacts.json` 每条记录包含 `ws_port` 字段：
+```json
+{
+  "uuid_xxx_50003": {
+    "name": "小红",
+    "ip": "192.168.215.128",
+    "ws_port": 50003,
+    "first_contact": "...",
+    "last_contact": "...",
+    "messages": [...]
+  }
+}
+```
+
+### 9.8 自节点过滤
+
+前后端多层过滤确保用户不会看到自己的节点：
+- 后端 `_handle_message`：UDP 层过滤 `uuid == self.my_uuid`
+- 后端 init 消息：过滤 contacts 和 online_peers 中的 `MY_UUID`
+- 后端 `_probe_saved_contacts`：跳过 `c["uuid"] == MY_UUID`
+- 后端 `ws_chat`：拒绝 `peer_uuid == MY_UUID` 的 self_connect
+- 前端 `handlePeerOnline` / `updateOnlinePeers` / `updateContacts`：跳过 `myInfo.uuid`
+- 前端 `connectByIp`：拒绝自己的 IP:端口
 
 ### 9.6 其他细节
 

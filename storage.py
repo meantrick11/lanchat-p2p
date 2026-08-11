@@ -60,29 +60,39 @@ def save_config(config: dict):
         )
 
 
-def load_contacts() -> dict:
-    """
-    读取全部联系人数据。
-    返回: {uuid: {name, ip, first_contact, last_contact, messages:[]}}
-    """
+def _load_contacts_unsafe() -> dict:
+    """读取全部联系人数据（不加锁，调用方需持有 _contacts_lock）"""
     ensure_data_dir()
     if CONTACTS_PATH.exists():
         try:
-            with _contacts_lock:
-                return json.loads(CONTACTS_PATH.read_text(encoding="utf-8"))
+            return json.loads(CONTACTS_PATH.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
 
 
-def save_contacts(contacts: dict):
-    """保存全部联系人数据到 data/contacts.json"""
+def _save_contacts_unsafe(contacts: dict):
+    """保存全部联系人数据（不加锁，调用方需持有 _contacts_lock）"""
     ensure_data_dir()
+    CONTACTS_PATH.write_text(
+        json.dumps(contacts, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_contacts() -> dict:
+    """
+    读取全部联系人数据（线程安全）。
+    返回: {uuid: {name, ip, first_contact, last_contact, messages:[]}}
+    """
     with _contacts_lock:
-        CONTACTS_PATH.write_text(
-            json.dumps(contacts, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        return _load_contacts_unsafe()
+
+
+def save_contacts(contacts: dict):
+    """保存全部联系人数据到 data/contacts.json（线程安全）"""
+    with _contacts_lock:
+        _save_contacts_unsafe(contacts)
 
 
 def get_contact(uuid: str) -> dict | None:
@@ -91,10 +101,11 @@ def get_contact(uuid: str) -> dict | None:
     return contacts.get(uuid)
 
 
-def upsert_contact(uuid: str, name: str, ip: str):
+def upsert_contact(uuid: str, name: str, ip: str, ws_port: int = 50002):
     """
     添加或更新联系人基本信息（不覆盖 messages）。
     首次接触时记录 first_contact，每次更新 last_contact。
+    ws_port 用于跨子网 HTTP 探活时知道对方监听端口。
     """
     contacts = load_contacts()
     now = datetime.now().isoformat()
@@ -103,6 +114,7 @@ def upsert_contact(uuid: str, name: str, ip: str):
         contacts[uuid] = {
             "name": name,
             "ip": ip,
+            "ws_port": ws_port,
             "first_contact": now,
             "last_contact": now,
             "messages": [],
@@ -110,6 +122,7 @@ def upsert_contact(uuid: str, name: str, ip: str):
     else:
         contacts[uuid]["name"] = name
         contacts[uuid]["ip"] = ip
+        contacts[uuid]["ws_port"] = ws_port
         contacts[uuid]["last_contact"] = now
         # 如果旧数据没有 messages 字段，补上
         if "messages" not in contacts[uuid]:
@@ -118,33 +131,75 @@ def upsert_contact(uuid: str, name: str, ip: str):
     save_contacts(contacts)
 
 
-def append_message(uuid: str, sender: str, content: str, msg_id: str):
+def append_message(uuid: str, sender: str, content: str, msg_id: str,
+                   msg_type: str = "chat", **extra):
     """
-    向指定联系人的消息列表追加一条消息。
-    sender: "me" 表示自己发的，否则是对面的 uuid。
-    同时更新 last_contact 时间。
-    """
-    contacts = load_contacts()
+    向指定联系人的消息列表追加或更新一条消息。
 
-    if uuid not in contacts:
-        # 极端情况：对方还没加入联系人（比如从在线列表直接发了消息但还未建立正式连接），先创建空记录
-        contacts[uuid] = {
-            "name": "Unknown",
-            "ip": "",
-            "first_contact": datetime.now().isoformat(),
-            "last_contact": "",
-            "messages": [],
+    参数:
+      uuid:     联系人 UUID
+      sender:   "me" 表示自己发的，否则是对面的 uuid
+      content:  消息文本内容（文件消息可为空或描述）
+      msg_id:   消息唯一 ID（去重依据）
+      msg_type: "chat" 或 "file"
+      extra:    文件消息的附加字段（file_name, file_size, transfer_id, status, progress）
+
+    线程安全：锁覆盖整个读→改→写周期，防止并发写入导致消息丢失。
+    msg_id 去重：chat 消息已存在则跳过；file 消息已存在则更新 status/progress 字段。
+    """
+    with _contacts_lock:
+        contacts = _load_contacts_unsafe()
+
+        if uuid not in contacts:
+            contacts[uuid] = {
+                "name": "Unknown",
+                "ip": "",
+                "first_contact": datetime.now().isoformat(),
+                "last_contact": "",
+                "messages": [],
+            }
+
+        # 查找是否已有同 msg_id 的消息
+        existing_idx = None
+        for i, m in enumerate(contacts[uuid].get("messages", [])):
+            if m.get("msg_id") == msg_id:
+                existing_idx = i
+                break
+
+        if existing_idx is not None:
+            if msg_type == "file":
+                # 文件消息：更新状态和进度（传输过程中状态会变化多次）
+                msg = contacts[uuid]["messages"][existing_idx]
+                for key in ("status", "progress", "file_size", "file_name", "transfer_id"):
+                    if key in extra:
+                        msg[key] = extra[key]
+                if extra.get("status") == "complete":
+                    msg["progress"] = 100
+            # chat 消息已存在则跳过（去重）
+            # 无论如何更新 last_contact
+            contacts[uuid]["last_contact"] = datetime.now().isoformat()
+            _save_contacts_unsafe(contacts)
+            return
+
+        # 新消息
+        msg = {
+            "from": sender,
+            "content": content,
+            "msg_id": msg_id,
+            "type": msg_type,
+            "timestamp": datetime.now().isoformat(),
         }
+        # 文件消息的额外字段
+        if msg_type == "file":
+            for key in ("file_name", "file_size", "transfer_id", "status", "progress"):
+                if key in extra:
+                    msg[key] = extra[key]
+            if "status" not in extra:
+                msg["status"] = "pending"
 
-    msg = {
-        "from": sender,
-        "content": content,
-        "msg_id": msg_id,
-        "timestamp": datetime.now().isoformat(),
-    }
-    contacts[uuid]["messages"].append(msg)
-    contacts[uuid]["last_contact"] = datetime.now().isoformat()
-    save_contacts(contacts)
+        contacts[uuid]["messages"].append(msg)
+        contacts[uuid]["last_contact"] = datetime.now().isoformat()
+        _save_contacts_unsafe(contacts)
 
 
 def get_messages(uuid: str) -> list[dict]:
@@ -172,6 +227,7 @@ def list_contacts() -> list[dict]:
             "uuid": uuid,
             "name": info.get("name", "Unknown"),
             "ip": info.get("ip", ""),
+            "ws_port": info.get("ws_port", 50002),
             "first_contact": info.get("first_contact", ""),
             "last_contact": info.get("last_contact", ""),
             "message_count": len(info.get("messages", [])),

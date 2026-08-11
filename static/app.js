@@ -9,6 +9,7 @@
  *   activeChats  - 活跃聊天 WS Map<uuid, WebSocket>
  *   currentChat  - 当前显示的聊天 uuid | null
  *   pendingMsgs  - 待确认消息 Map<msg_id, {content, uuid, timestamp}>
+ *   pendingFileTransfers - 待处理的文件上传 {transferId: {file, uuid, ...}}
  */
 
 // ===== 全局状态 =====
@@ -16,12 +17,16 @@ let myInfo = null;
 let onlinePeers = new Map();
 let contacts = new Map();
 let pendingRequests = new Map();
-let activeChats = new Map();
+let activeChats = new Map();         // uuid → WebSocket（主动发起方有值）
+let connectedPeers = new Set();      // 连接已确认的 peer uuid（双方向都追踪，含接收方）
 let currentChat = null;
 let pendingMessages = new Map();
 let controlWs = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+
+// 文件传输状态
+let pendingFileTransfers = {};
 
 // ===== DOM 引用 =====
 const $ = (id) => document.getElementById(id);
@@ -43,6 +48,7 @@ const btnSendFile = $('btn-send-file');
 const fileInput = $('file-input');
 const btnCloseChat = $('btn-close-chat');
 const btnDeleteContact = $('btn-delete-contact');
+const btnDisconnect = $('btn-disconnect');
 const btnScan = $('btn-scan');
 const btnEditName = $('btn-edit-name');
 const modalOverlay = $('modal-overlay');
@@ -115,7 +121,36 @@ function bindEvents() {
     btnSendFile.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', onFileSelected);
     btnCloseChat.addEventListener('click', closeCurrentChat);
+    btnDisconnect.addEventListener('click', disconnectCurrentChat);
     btnDeleteContact.addEventListener('click', deleteCurrentContact);
+
+    // 手动连接：toggle 展开/收起
+    const btnManualConnect = $('btn-manual-connect');
+    const manualIpInput = $('manual-ip-input');
+
+    btnManualConnect.addEventListener('click', () => {
+        const raw = manualIpInput.value.trim();
+        if (!raw) return;
+        let [ip, port] = raw.split(':');
+        port = parseInt(port) || 50002;
+        connectByIp(ip, port);
+        manualIpInput.value = '';
+        toggleManualConnect(); // 收起
+    });
+    manualIpInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') btnManualConnect.click();
+    });
+}
+
+/** 展开/收起手动连接输入行（内联 onclick 和 JS 均可调用） */
+function toggleManualConnect() {
+    const row = $('manual-connect-row');
+    const btn = $('btn-toggle-manual');
+    if (!row || !btn) return;
+    const visible = row.style.display !== 'none';
+    row.style.display = visible ? 'none' : '';
+    btn.textContent = visible ? '➕' : '✖';
+    if (!visible) $('manual-ip-input').focus();
 }
 
 // ===== 定时轮询 =====
@@ -152,14 +187,17 @@ function handleControlMessage(msg) {
         pending_update: handlePendingUpdate,
         connection_established: handleConnectionEstablished,
         peer_disconnected: handlePeerDisconnected,
+        disconnected: handleDisconnected,
         chat_message: handleIncomingMessage,
         message_ack: handleMessageAck,
         send_failed: handleSendFailed,
         incoming_file_request: handleIncomingFileRequest,
-        file_request_response: handleFileRequestResponse,
+        file_request_response: handleFileRequestResponseFromControl,
+        forward_file_response: handleForwardFileResponse,
         transfer_progress: handleTransferProgress,
         transfer_complete: handleTransferComplete,
         transfer_cancelled: handleTransferCancelled,
+        transfer_resumed: handleTransferResumed,
     };
     const handler = handlers[msg.type];
     if (handler) handler(msg);
@@ -184,6 +222,8 @@ function handleInit(msg) {
 }
 
 function handlePeerOnline(msg) {
+    // 过滤自己
+    if (msg.uuid === myInfo.uuid) return;
     onlinePeers.set(msg.uuid, { name: msg.name, ip: msg.ip, ws_port: msg.ws_port, token: msg.token });
     // 如果历史联系人里有，更新在线状态
     if (contacts.has(msg.uuid)) {
@@ -218,12 +258,13 @@ function handleIncomingConnection(msg) {
 }
 
 function handlePendingUpdate(msg) {
-    // county 可能在 pending 列表被其他地方修改后推送
+    // count 可能在 pending 列表被其他地方修改后推送
     if (msg.count === 0) pendingRequests.clear();
 }
 
 function handleConnectionEstablished(msg) {
     pendingRequests.delete(msg.uuid);
+    connectedPeers.add(msg.uuid);  // 接收方也标记为已连接
     // 加入联系人
     contacts.set(msg.uuid, {
         name: msg.name,
@@ -232,7 +273,9 @@ function handleConnectionEstablished(msg) {
         messages: [],
     });
     renderPendingList();
+    renderOnlineList();
     renderContactsList();
+    updateChatHeaderStatus();
     // 如果正在等对方的确认（主动发起方），打开聊天
     if (currentChat === msg.uuid || !currentChat) {
         openChat(msg.uuid);
@@ -241,17 +284,32 @@ function handleConnectionEstablished(msg) {
 
 function handlePeerDisconnected(msg) {
     activeChats.delete(msg.uuid);
+    connectedPeers.delete(msg.uuid);
     pendingRequests.delete(msg.uuid);
     renderPendingList();
+    renderOnlineList();
+    renderContactsList();
     if (currentChat === msg.uuid) {
         updateChatHeaderStatus();
         addSystemMessage(msg.uuid, `${msg.name || '对方'} 已断开连接`);
     }
 }
 
+/** 自己主动断开后的确认回调（后端关闭对端 WS 后返回） */
+function handleDisconnected(msg) {
+    activeChats.delete(msg.uuid);
+    connectedPeers.delete(msg.uuid);
+    renderOnlineList();
+    renderContactsList();
+    if (currentChat === msg.uuid) {
+        updateChatHeaderStatus();
+        addSystemMessage(msg.uuid, '你已断开连接');
+    }
+}
+
 function handleIncomingMessage(msg) {
     const uuid = msg.from;
-    // 保存消息到联系人
+    // 保存消息到联系人内存
     if (!contacts.has(uuid)) {
         contacts.set(uuid, { name: msg.from_name, ip: '', status: 'online', messages: [] });
     }
@@ -262,6 +320,15 @@ function handleIncomingMessage(msg) {
         msg_id: msg.msg_id,
         timestamp: msg.timestamp,
     });
+    // 立即通知后端持久化到 contacts.json（与后端 _relay_from_peer 形成双保险，
+    // storage.append_message 内部有 msg_id 去重，重复调用安全）
+    controlWs.send(JSON.stringify({
+        type: 'save_message',
+        peer_uuid: uuid,
+        sender: uuid,
+        content: msg.content,
+        msg_id: msg.msg_id,
+    }));
     if (currentChat === uuid) {
         renderMessages(uuid);
     }
@@ -293,33 +360,111 @@ function handleIncomingFileRequest(msg) {
     showFileRequestModal(msg);
 }
 
+/**
+ * 处理来自控制 WS 的文件请求响应（通过后端 _relay_from_peer 转发的）。
+ * 与来自聊天 WS 直连的响应统一走 handleFileRequestResponse。
+ */
+function handleFileRequestResponseFromControl(msg) {
+    handleFileRequestResponse(msg);
+}
+
+/**
+ * 统一处理文件请求响应。
+ * 发送方会从聊天 WS 直连或控制 WS 两条路径收到此消息，
+ * 通过 transfer_id 精确匹配，且幂等（started 标记防止重复启动上传）。
+ */
 function handleFileRequestResponse(msg) {
+    const transferId = msg.transfer_id;
+    const t = pendingFileTransfers[transferId];
+    if (!t) return; // 不是我们的传输
+
     if (msg.accepted) {
-        console.log(`[Transfer] 对方接受传输: ${msg.transfer_id}`);
+        if (t.started) return; // 已启动，幂等
+        t.started = true;
+        startChunkUpload(transferId);
     } else {
+        // 对方拒绝
+        delete pendingFileTransfers[transferId];
+        const fileMsg = findFileMsgByTransferId(transferId);
+        if (fileMsg) {
+            fileMsg.status = 'failed';
+            // 通过 transferId 找到对应的联系人 uuid
+            saveFileMessage(t.uuid, fileMsg);
+            if (currentChat) renderMessages(currentChat);
+        }
         showToast('对方拒绝了文件传输');
     }
 }
 
 function handleTransferProgress(msg) {
-    // 更新传输进度（可在聊天区或侧边栏展示进度条）
-    console.log(`[Transfer] 进度: ${msg.received_bytes}/${msg.total_bytes}`);
+    // 接收方：更新文件消息进度
+    const fileMsg = findFileMsgByTransferId(msg.transfer_id);
+    if (fileMsg && msg.total_bytes > 0) {
+        fileMsg.progress = Math.round(msg.received_bytes / msg.total_bytes * 100);
+        if (currentChat) renderMessages(currentChat);
+    }
 }
 
 function handleTransferComplete(msg) {
-    showToast(`文件接收完成: ${msg.file_name}`);
-    addSystemMessage(currentChat, `文件 ${msg.file_name} 接收完成 ✓`);
+    // 接收方：传输完成
+    const fileMsg = findFileMsgByTransferId(msg.transfer_id);
+    if (fileMsg) {
+        fileMsg.status = msg.verified ? 'complete' : 'failed';
+        fileMsg.progress = 100;
+        saveFileMessage(currentChat, fileMsg);
+        if (currentChat) renderMessages(currentChat);
+    }
+    if (msg.verified) {
+        showToast(`文件接收完成: ${msg.file_name}`);
+    } else {
+        showToast(`文件校验失败: ${msg.file_name}`);
+    }
 }
 
 function handleTransferCancelled(msg) {
-    showToast('对方取消了文件传输');
-    addSystemMessage(currentChat, '文件传输已取消');
+    const fileMsg = findFileMsgByTransferId(msg.transfer_id);
+    if (fileMsg) {
+        fileMsg.status = 'cancelled';
+        saveFileMessage(currentChat, fileMsg);
+        if (currentChat) renderMessages(currentChat);
+    }
+    // 清理上传方状态
+    if (pendingFileTransfers[msg.transfer_id]) {
+        delete pendingFileTransfers[msg.transfer_id];
+    }
+    showToast('文件传输已取消');
+}
+
+function handleTransferResumed(msg) {
+    // 续传恢复通知 — 不做额外弹窗，进度条会在 transfer_progress 中更新
+    const fileMsg = findFileMsgByTransferId(msg.transfer_id);
+    if (fileMsg) {
+        fileMsg.status = 'downloading';
+        if (currentChat) renderMessages(currentChat);
+    }
+}
+
+/**
+ * 当后端无法直接发送 file_response 给发送方时（发送方是被动接收方，无 incoming WS），
+ * 后端通知本浏览器通过本方的 chat WS 转发响应给对端后端。
+ */
+function handleForwardFileResponse(msg) {
+    const chatWs = activeChats.get(msg.to_uuid);
+    if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+        chatWs.send(JSON.stringify({
+            type: 'file_response',
+            transfer_id: msg.transfer_id,
+            accepted: msg.accepted,
+        }));
+    }
 }
 
 // ===== 在线列表渲染 =====
 function updateOnlinePeers(peers) {
     onlinePeers.clear();
     for (const p of peers) {
+        // 过滤自己
+        if (p.uuid === myInfo.uuid) continue;
         // 保存 token，用于建立连接时出示给对方后端验证
         onlinePeers.set(p.uuid, { name: p.name, ip: p.ip, ws_port: p.ws_port, token: p.token });
     }
@@ -327,6 +472,14 @@ function updateOnlinePeers(peers) {
     // 同时刷新联系人列表的状态（在线/离线圆点）
     renderContactsList();
     updateChatHeaderStatus();
+}
+
+/** 获取指定用户的连接状态文本（主动方查 activeChats，被动方查 connectedPeers） */
+function getConnectionLabel(uuid) {
+    const ws = activeChats.get(uuid);
+    const wsOpen = ws && ws.readyState === WebSocket.OPEN;
+    const connected = wsOpen || connectedPeers.has(uuid);
+    return connected ? ' 🔗已连接' : '';
 }
 
 function renderOnlineList() {
@@ -339,10 +492,11 @@ function renderOnlineList() {
     for (const [uuid, peer] of onlinePeers) {
         const div = document.createElement('div');
         div.className = `item${currentChat === uuid ? ' active' : ''}`;
+        const connLabel = getConnectionLabel(uuid);
         div.innerHTML = `
             <span class="dot online"></span>
             <div class="info">
-                <div class="name">${esc(peer.name)}</div>
+                <div class="name">${esc(peer.name)}${connLabel}</div>
                 <div class="sub">${esc(peer.ip)}</div>
             </div>`;
         div.addEventListener('click', () => connectToPeer(uuid, peer.name, peer.ip));
@@ -401,6 +555,8 @@ async function respondConnection(uuid, accepted) {
 // ===== 历史联系人列表渲染 =====
 function updateContacts(list) {
     for (const c of list) {
+        // 过滤自己
+        if (c.uuid === myInfo.uuid) continue;
         if (!contacts.has(c.uuid)) {
             contacts.set(c.uuid, {
                 name: c.name,
@@ -439,7 +595,8 @@ function renderContactsList() {
         // 用实时在线列表判断状态，与点击行为保持一致
         const isOnline = onlinePeers.has(uuid);
         const dotClass = isOnline ? 'online' : 'offline';
-        const statusText = isOnline ? '' : ' (离线)';
+        const connLabel = getConnectionLabel(uuid);
+        const statusText = isOnline ? connLabel : ' (离线)';
         div.innerHTML = `
             <span class="dot ${dotClass}"></span>
             <div class="info">
@@ -519,6 +676,8 @@ async function connectToPeer(uuid, name, ip) {
                 uuid: myInfo.uuid,
                 name: myInfo.name,
                 token: myInfo.token,
+                ip: myInfo.ip,
+                ws_port: myInfo.ws_port,
             }));
         };
 
@@ -526,14 +685,19 @@ async function connectToPeer(uuid, name, ip) {
             const msg = JSON.parse(e.data);
             if (msg.type === 'connect_accepted') {
                 activeChats.set(uuid, ws);
+                connectedPeers.add(uuid);
                 setupPeerMessageHandler(uuid, ws);
                 addSystemMessage(uuid, '连接已建立');
+                updateChatHeaderStatus();
+                renderOnlineList();
+                renderContactsList();
                 // 通知自己后端保存联系人（对方后端已保存，自己后端也需要记录）
                 controlWs.send(JSON.stringify({
                     type: 'save_contact',
                     uuid: uuid,
                     name: name,
                     ip: ip,
+                    ws_port: peer.ws_port || 50002,
                 }));
             } else if (msg.type === 'connect_rejected') {
                 ws.close();
@@ -545,6 +709,9 @@ async function connectToPeer(uuid, name, ip) {
 
         ws.onclose = () => {
             activeChats.delete(uuid);
+            connectedPeers.delete(uuid);
+            renderOnlineList();
+            renderContactsList();
             if (currentChat === uuid) {
                 addSystemMessage(uuid, '连接已断开');
                 updateChatHeaderStatus();
@@ -563,6 +730,132 @@ async function connectToPeer(uuid, name, ip) {
     }
 }
 
+/**
+ * 手动输入 IP 连接（跨子网场景）。
+ * 与 connectToPeer 的区别：不需要对方在 onlinePeers 中（UDP 广播到不了）。
+ */
+async function connectByIp(ip, port) {
+    port = port || 50002;
+    // 生成临时 UUID（等 connect_accepted 时会替换为真实 UUID）
+    const tempUuid = 'manual_' + ip + '_' + port;
+
+    if (activeChats.has(tempUuid)) {
+        showToast('已在连接中');
+        return;
+    }
+
+    // 防止自连：不能连自己的 IP:端口
+    if (ip === myInfo.ip && port === myInfo.ws_port) {
+        showToast('不能连接到自己的实例');
+        return;
+    }
+
+    openChat(tempUuid);
+    addSystemMessage(tempUuid, `正在连接 ${ip}:${port}...`);
+
+    // 连接前刷新自己的 token
+    try {
+        const resp = await fetch('/api/me');
+        const me = await resp.json();
+        myInfo.token = me.token;
+    } catch (e) { /* ignore */ }
+
+    try {
+        const wsUrl = `ws://${ip}:${port}/ws/chat`;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            ws.send(JSON.stringify({
+                type: 'connect_request',
+                uuid: myInfo.uuid,
+                name: myInfo.name,
+                token: myInfo.token,
+                ip: myInfo.ip,
+                ws_port: myInfo.ws_port,
+            }));
+        };
+
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'connect_accepted') {
+                const realUuid = msg.uuid || tempUuid;
+                const realName = msg.name || '手动连接';
+                const realIp = msg.ip || ip;
+
+                // 替换临时连接为真实连接
+                activeChats.set(realUuid, ws);
+                connectedPeers.add(realUuid);
+                setupPeerMessageHandler(realUuid, ws);
+                // 修正 close 回调使用真实 UUID
+                ws.onclose = () => {
+                    activeChats.delete(realUuid);
+                    connectedPeers.delete(realUuid);
+                    renderOnlineList();
+                    renderContactsList();
+                    if (currentChat === realUuid) {
+                        addSystemMessage(realUuid, '连接已断开');
+                        updateChatHeaderStatus();
+                    }
+                };
+                // 迁移临时联系人数据
+                if (contacts.has(tempUuid)) {
+                    contacts.delete(tempUuid);
+                }
+                contacts.set(realUuid, {
+                    name: realName,
+                    ip: realIp,
+                    status: 'online',
+                    messages: [],
+                });
+                if (currentChat === tempUuid) {
+                    currentChat = realUuid;
+                    chatPeerName.textContent = realName;
+                    updateChatHeaderStatus();
+                }
+                addSystemMessage(realUuid, '连接已建立 ✓');
+                // 通知后端保存联系人
+                controlWs.send(JSON.stringify({
+                    type: 'save_contact',
+                    uuid: realUuid,
+                    name: realName,
+                    ip: realIp,
+                    ws_port: port,
+                }));
+                renderOnlineList();
+                renderContactsList();
+            } else if (msg.type === 'connect_rejected') {
+                ws.close();
+                const reason = msg.reason === 'invalid_token'
+                    ? 'Token 验证失败，请稍后重试'
+                    : '对方拒绝了连接请求';
+                addSystemMessage(tempUuid, reason);
+                showToast(reason);
+            }
+        };
+
+        ws.onclose = () => {
+            activeChats.delete(tempUuid);
+            connectedPeers.delete(tempUuid);
+            renderOnlineList();
+            renderContactsList();
+            if (currentChat === tempUuid) {
+                addSystemMessage(tempUuid, '连接已断开');
+                updateChatHeaderStatus();
+            }
+        };
+
+        ws.onerror = () => {
+            activeChats.delete(tempUuid);
+            addSystemMessage(tempUuid, `连接失败: ${ip}:${port}`);
+            showToast('连接失败，请检查地址');
+            ws.close();
+        };
+
+    } catch (e) {
+        addSystemMessage(tempUuid, `连接失败: ${e.message}`);
+    }
+}
+
 /** 为对端 WS 设置消息处理器（收到 connect_accepted 后调用） */
 function setupPeerMessageHandler(uuid, ws) {
     ws.onmessage = (e) => {
@@ -570,9 +863,32 @@ function setupPeerMessageHandler(uuid, ws) {
         if (msg.type === 'chat') {
             // 对方发来的聊天消息（直接从 ws 收到时也需要处理）
             handleDirectChatMessage(uuid, msg);
+        } else if (msg.type === 'file_request') {
+            // 对端后端通过 chat WS 发来的文件请求（HTTP relay 失败的 fallback）
+            // 先在自己后端注册 transfer，再弹窗确认
+            controlWs.send(JSON.stringify({
+                type: 'register_transfer',
+                transfer_id: msg.transfer_id,
+                file_name: msg.file_name,
+                file_size: msg.file_size,
+                chunk_size: msg.chunk_size,
+                total_chunks: msg.total_chunks,
+                from_uuid: uuid,
+                from_name: contacts.get(uuid) ? contacts.get(uuid).name : 'Unknown',
+            }));
+            // 用 from_uuid（chat WS 的对端 uuid）触发弹窗
+            showFileRequestModal({
+                transfer_id: msg.transfer_id,
+                file_name: msg.file_name,
+                file_size: msg.file_size,
+                from_uuid: uuid,
+                from_name: contacts.get(uuid) ? contacts.get(uuid).name : 'Unknown',
+            });
         } else if (msg.type === 'file_response') {
+            // 对方对我方文件请求的响应
             handleFileRequestResponse(msg);
         } else if (msg.type === 'file_cancel') {
+            // 对方取消了传输
             handleTransferCancelled(msg);
         } else if (msg.type === 'ack') {
             handleMessageAck(msg);
@@ -637,14 +953,117 @@ function closeCurrentChat() {
     renderContactsList();
 }
 
+/** 主动断开当前聊天连接（关闭双方 WS，无需对方确认） */
+function disconnectCurrentChat() {
+    if (!currentChat) return;
+    const uuid = currentChat;
+    const contact = contacts.get(uuid);
+    const peerName = contact ? contact.name : '对方';
+
+    // 检查是否有正在进行的文件传输
+    for (const [tid, t] of Object.entries(pendingFileTransfers)) {
+        if (t.uuid === uuid) {
+            if (!confirm(`${peerName} 有正在传输的文件，断开连接将中断传输。确定断开？`)) {
+                return;
+            }
+            break;
+        }
+    }
+
+    if (!confirm(`确定断开与 ${peerName} 的连接？`)) return;
+
+    // 1. 关闭本方的 outgoing chat WS（如果我们是主动发起方）
+    const chatWs = activeChats.get(uuid);
+    if (chatWs) {
+        try { chatWs.close(); } catch (e) { /* ignore */ }
+        activeChats.delete(uuid);
+    }
+
+    // 2. 通知后端关闭 incoming chat WS（如果我们是接收方）
+    controlWs.send(JSON.stringify({
+        type: 'disconnect',
+        to_uuid: uuid,
+    }));
+
+    // 3. 清理本地状态
+    connectedPeers.delete(uuid);
+
+    // 4. 清理待处理的文件传输
+    for (const [tid, t] of Object.entries(pendingFileTransfers)) {
+        if (t.uuid === uuid) {
+            delete pendingFileTransfers[tid];
+        }
+    }
+
+    // 5. 更新 UI
+    renderOnlineList();
+    renderContactsList();
+    updateChatHeaderStatus();
+    addSystemMessage(uuid, '你已断开连接');
+}
+
+async function deleteCurrentContact() {
+    if (!currentChat) return;
+    const uuid = currentChat;
+    const contact = contacts.get(uuid);
+    const peerName = contact ? contact.name : '对方';
+
+    if (!confirm(`确定删除联系人 ${peerName} 及其所有聊天记录？此操作不可恢复。`)) return;
+
+    // 先断开底层 WS 连接（如果已连接），再删除联系人
+    const chatWs = activeChats.get(uuid);
+    if (chatWs || connectedPeers.has(uuid)) {
+        // 关闭本方 outgoing WS
+        if (chatWs) {
+            try { chatWs.close(); } catch (e) { /* ignore */ }
+            activeChats.delete(uuid);
+        }
+        // 通知后端关闭 incoming WS
+        controlWs.send(JSON.stringify({ type: 'disconnect', to_uuid: uuid }));
+        connectedPeers.delete(uuid);
+
+        // 清理文件传输
+        for (const [tid, t] of Object.entries(pendingFileTransfers)) {
+            if (t.uuid === uuid) delete pendingFileTransfers[tid];
+        }
+    }
+
+    // 通知后端删除联系人
+    try {
+        controlWs.send(JSON.stringify({ type: 'delete_contact', uuid: uuid }));
+    } catch (e) { /* ignore */ }
+    contacts.delete(uuid);
+    closeCurrentChat();
+    renderOnlineList();
+    renderContactsList();
+    showToast('联系人已删除');
+}
+
 function updateChatHeaderStatus() {
     if (!currentChat) return;
     const online = onlinePeers.has(currentChat);
-    chatPeerStatus.textContent = online ? '🟢 在线' : '🔴 离线';
-    chatPeerStatus.className = online ? 'online' : 'offline';
+    const chatWs = activeChats.get(currentChat);
+    const wsConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(currentChat);
+
+    // 在线 + 已连接 = 绿色；在线但未连接 = 黄色；离线 = 灰色
+    let statusText, statusClass;
+    if (online && wsConnected) {
+        statusText = '🟢 已连接';
+        statusClass = 'online';
+    } else if (online && !wsConnected) {
+        statusText = '🟡 在线（未建立聊天连接）';
+        statusClass = 'online';
+    } else {
+        statusText = '🔴 离线';
+        statusClass = 'offline';
+    }
+    chatPeerStatus.textContent = statusText;
+    chatPeerStatus.className = statusClass;
     msgInput.disabled = !online;
     btnSend.disabled = !online;
     btnSendFile.disabled = !online;
+    // 显示/隐藏断开按钮：仅当已连接时显示
+    btnDisconnect.style.display = wsConnected ? '' : 'none';
 }
 
 // ===== 发送消息 =====
@@ -717,6 +1136,23 @@ function renderMessages(uuid) {
     const items = contact.messages;
     for (const m of items) {
         const div = document.createElement('div');
+
+        // 文件消息（type === 'file' 或 msg_id 以 'f_' 开头做回退检测）
+        if (m.type === 'file' || (m.msg_id && typeof m.msg_id === 'string' && m.msg_id.startsWith('f_'))) {
+            renderFileBubble(div, m);
+            chatMessages.appendChild(div);
+            continue;
+        }
+
+        // 系统消息
+        if (m.from === 'system') {
+            div.className = 'msg system';
+            div.textContent = m.content;
+            chatMessages.appendChild(div);
+            continue;
+        }
+
+        // 普通文本消息
         if (m.from === 'me') {
             div.className = 'msg sent';
             const statusIcon = m.status === 'sending' ? '🕒' :
@@ -730,7 +1166,56 @@ function renderMessages(uuid) {
         }
         chatMessages.appendChild(div);
     }
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+    // requestAnimationFrame 确保 flex 布局计算完成后再滚到底部
+    requestAnimationFrame(() => {
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    });
+}
+
+/** 渲染文件消息气泡 */
+function renderFileBubble(container, msg) {
+    const isSent = msg.direction === 'send' || msg.from === 'me';
+    container.className = `msg file-msg ${isSent ? 'sent' : 'received'}`;
+
+    // 兼容旧数据：从 transfer_id 或 msg_id 推导 transfer_id
+    const transferId = msg.transfer_id || (msg.msg_id && msg.msg_id.startsWith('f_t_') ? msg.msg_id.slice(2) : '');
+    const fileName = msg.file_name || '未知文件';
+    const fileSize = msg.file_size || 0;
+    const status = msg.status || 'failed';
+    const progress = msg.progress || 0;
+
+    let statusText = '';
+    if (status === 'waiting') statusText = '等待对方确认...';
+    else if (status === 'uploading') statusText = `发送中 ${progress}%`;
+    else if (status === 'downloading') statusText = `接收中 ${progress}%`;
+    else if (status === 'complete') statusText = isSent ? '发送完成 ✓' : '接收完成 ✓';
+    else if (status === 'failed') statusText = '传输失败 ✗';
+    else if (status === 'cancelled') statusText = '已取消';
+
+    const showProgress = status === 'uploading' || status === 'downloading' || status === 'waiting';
+    const showOpen = status === 'complete' && !isSent;
+
+    let actionHtml = '';
+    if (showOpen) {
+        actionHtml = `<button class="btn-open-file" onclick="openDownloadedFile('${escAttr(fileName)}')">📂 打开文件</button>`;
+    }
+
+    container.innerHTML = `
+        <div class="file-card">
+            <div class="file-icon">📄</div>
+            <div class="file-info">
+                <div class="file-name">${esc(fileName)}</div>
+                <div class="file-size">${formatSize(fileSize)}</div>
+                ${showProgress ? `
+                <div class="file-progress-bar">
+                    <div class="file-progress-fill" style="width:${progress}%"></div>
+                </div>` : ''}
+                <div class="file-status">${statusText}</div>
+                ${actionHtml}
+            </div>
+        </div>
+        <div class="file-time">${fmtTime(msg.timestamp)}</div>
+    `;
 }
 
 function addSystemMessage(uuid, text) {
@@ -745,6 +1230,7 @@ function addSystemMessage(uuid, text) {
 }
 
 // ===== 文件传输 =====
+
 function onFileSelected() {
     const file = fileInput.files[0];
     fileInput.value = '';
@@ -752,81 +1238,100 @@ function onFileSelected() {
     sendFile(currentChat, file);
 }
 
+/**
+ * 发送文件：添加文件消息气泡 → 发 file_request → 等对方响应后自动开始上传。
+ */
 async function sendFile(uuid, file) {
     const CHUNK_SIZE = 64 * 1024; // 64KB
     const transferId = 't_' + myInfo.uuid + '_' + Date.now();
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-    // 通过聊天 WS 发 file_request
-    const ws = activeChats.get(uuid);
-    if (!ws) {
-        showToast('未连接到对方，请先建立聊天');
-        return;
-    }
+    // 在聊天中插入文件消息气泡（初始状态：等待确认）
+    const contact = contacts.get(uuid);
+    if (!contact.messages) contact.messages = [];
+    const fileMsg = {
+        from: 'me',
+        type: 'file',
+        msg_id: 'f_' + transferId,
+        timestamp: new Date().toISOString(),
+        file_name: file.name,
+        file_size: file.size,
+        transfer_id: transferId,
+        direction: 'send',
+        status: 'waiting',
+        progress: 0,
+    };
+    contact.messages.push(fileMsg);
+    renderMessages(uuid);
 
-    ws.send(JSON.stringify({
-        type: 'file_request',
+    // 持久化文件消息
+    saveFileMessage(uuid, fileMsg);
+
+    // 注册待处理传输
+    pendingFileTransfers[transferId] = {
+        file: file,
+        uuid: uuid,
+        totalChunks: totalChunks,
+        CHUNK_SIZE: CHUNK_SIZE,
+        transferId: transferId,
+        currentChunk: 0,
+        started: false,
+    };
+
+    const fileRequestMsg = {
         transfer_id: transferId,
         file_name: file.name,
         file_size: file.size,
         chunk_size: CHUNK_SIZE,
         total_chunks: totalChunks,
         resume: false,
-    }));
-
-    // 等待 file_response（通过 control ws 回调继续）
-    addSystemMessage(uuid, `发送文件: ${file.name} (${formatSize(file.size)})`);
-
-    // 开始发送分片
-    window._pendingFileTransfers = window._pendingFileTransfers || {};
-    window._pendingFileTransfers[transferId] = { file, uuid, totalChunks, CHUNK_SIZE, transferId, currentChunk: 0 };
-
-    // 等待对方响应后开始发送分片
-    const originalHandler = handleFileRequestResponse;
-    const onceHandler = (msg) => {
-        if (msg.transfer_id === transferId) {
-            if (msg.accepted) {
-                startChunkUpload(transferId);
-            }
-            // 恢复原始处理器
-            window._fileResponseHandler = originalHandler;
-        }
     };
-    window._fileResponseHandler = (msg) => {
-        originalHandler(msg);
-        onceHandler(msg);
-    };
-}
 
-function handleFileRequestResponse(msg) {
-    if (window._fileResponseHandler) {
-        window._fileResponseHandler(msg);
-    } else if (msg.accepted) {
-        // 查找匹配的传输并开始上传
-        const transfers = window._pendingFileTransfers || {};
-        for (const [tid, t] of Object.entries(transfers)) {
-            if (!t.started) {
-                t.started = true;
-                startChunkUpload(tid);
-                break;
-            }
-        }
+    // 优先走直连 chat WS；没有则回退到 control WS 转发
+    const ws = activeChats.get(uuid);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'file_request', ...fileRequestMsg }));
+    } else {
+        // 回退路径：通过 control WS → 自己后端 → 转发给对端
+        controlWs.send(JSON.stringify({
+            type: 'file_request',
+            to_uuid: uuid,
+            ...fileRequestMsg,
+        }));
     }
 }
 
+/**
+ * 开始分片上传文件到对方后端。
+ * 每发送一个分片后更新聊天气泡中的进度。
+ */
 async function startChunkUpload(transferId) {
-    const t = window._pendingFileTransfers?.[transferId];
+    const t = pendingFileTransfers[transferId];
     if (!t) return;
+
+    const fileMsg = findFileMsgByTransferId(transferId);
+    if (fileMsg) {
+        fileMsg.status = 'uploading';
+        saveFileMessage(t.uuid, fileMsg);
+        if (currentChat === t.uuid) renderMessages(t.uuid);
+    }
 
     const peer = onlinePeers.get(t.uuid);
     if (!peer) {
         showToast('对方不在线，无法发送文件');
+        if (fileMsg) {
+            fileMsg.status = 'failed';
+            saveFileMessage(t.uuid, fileMsg);
+            if (currentChat === t.uuid) renderMessages(t.uuid);
+        }
+        delete pendingFileTransfers[transferId];
         return;
     }
 
     const file = t.file;
     const CHUNK_SIZE = t.CHUNK_SIZE;
     const totalChunks = t.totalChunks;
+    const peerPort = peer.ws_port || 50002;
 
     for (let i = t.currentChunk; i < totalChunks; i++) {
         const start = i * CHUNK_SIZE;
@@ -839,8 +1344,7 @@ async function startChunkUpload(transferId) {
 
         while (retries < 3 && !success) {
             try {
-                const peerPort = peer.ws_port || 50002;
-            const resp = await fetch(`http://${peer.ip}:${peerPort}/api/transfer/chunk`, {
+                const resp = await fetch(`http://${peer.ip}:${peerPort}/api/transfer/chunk`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -852,6 +1356,11 @@ async function startChunkUpload(transferId) {
                 if (resp.ok) {
                     success = true;
                     t.currentChunk = i + 1;
+                    // 更新进度条
+                    if (fileMsg) {
+                        fileMsg.progress = Math.round((i + 1) / totalChunks * 100);
+                        if (currentChat === t.uuid) renderMessages(t.uuid);
+                    }
                 } else {
                     retries++;
                 }
@@ -861,25 +1370,38 @@ async function startChunkUpload(transferId) {
         }
 
         if (!success) {
-            addSystemMessage(t.uuid, '文件传输中断，等待对方重新上线');
-            return; // 传输暂停，等待后续续传
+            if (fileMsg) {
+                fileMsg.status = 'failed';
+                saveFileMessage(t.uuid, fileMsg);
+                if (currentChat === t.uuid) renderMessages(t.uuid);
+            }
+            delete pendingFileTransfers[transferId];
+            return; // 传输中断
         }
     }
 
-    // 完成
+    // 所有分片发送完毕 → 通知对方合并
     try {
-        const peerPort = peer.ws_port || 50002;
         await fetch(`http://${peer.ip}:${peerPort}/api/transfer/complete`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ transfer_id: transferId }),
         });
-        addSystemMessage(t.uuid, `文件 ${file.name} 发送完成 ✓`);
+        if (fileMsg) {
+            fileMsg.status = 'complete';
+            fileMsg.progress = 100;
+            saveFileMessage(t.uuid, fileMsg);
+            if (currentChat === t.uuid) renderMessages(t.uuid);
+        }
     } catch (e) {
-        addSystemMessage(t.uuid, '文件传输完成确认失败');
+        if (fileMsg) {
+            fileMsg.status = 'failed';
+            saveFileMessage(t.uuid, fileMsg);
+            if (currentChat === t.uuid) renderMessages(t.uuid);
+        }
     }
 
-    delete window._pendingFileTransfers?.[transferId];
+    delete pendingFileTransfers[transferId];
 }
 
 function readAsBase64(blob) {
@@ -896,6 +1418,7 @@ function readAsBase64(blob) {
 }
 
 // ===== 文件传输弹窗 =====
+
 function showFileRequestModal(msg) {
     fileModalTitle.textContent = '文件传输请求';
     fileModalBody.innerHTML = `
@@ -907,13 +1430,43 @@ function showFileRequestModal(msg) {
     fileModalOverlay.style.display = '';
 
     $('btn-file-accept').addEventListener('click', () => {
+        // 发送接受响应
         controlWs.send(JSON.stringify({
             type: 'file_response',
             transfer_id: msg.transfer_id,
             accepted: true,
         }));
+
+        // 在聊天中插入接收文件消息气泡
+        const uuid = msg.from_uuid;
+        if (!contacts.has(uuid)) {
+            contacts.set(uuid, { name: msg.from_name, ip: '', status: 'online', messages: [] });
+        }
+        const contact = contacts.get(uuid);
+        const fileMsg = {
+            from: uuid,
+            type: 'file',
+            msg_id: 'f_' + msg.transfer_id,
+            timestamp: new Date().toISOString(),
+            file_name: msg.file_name,
+            file_size: msg.file_size,
+            transfer_id: msg.transfer_id,
+            direction: 'receive',
+            status: 'downloading',
+            progress: 0,
+        };
+        contact.messages.push(fileMsg);
+        // 持久化文件消息
+        saveFileMessage(uuid, fileMsg);
+        if (currentChat === uuid) {
+            renderMessages(uuid);
+        } else {
+            openChat(uuid);
+        }
+
         fileModalOverlay.style.display = 'none';
     });
+
     $('btn-file-reject').addEventListener('click', () => {
         controlWs.send(JSON.stringify({
             type: 'file_response',
@@ -922,6 +1475,46 @@ function showFileRequestModal(msg) {
         }));
         fileModalOverlay.style.display = 'none';
     });
+}
+
+// ===== 文件传输辅助函数 =====
+
+/** 根据 transfer_id 在所有联系人的消息中查找文件消息 */
+function findFileMsgByTransferId(transferId) {
+    for (const [uuid, contact] of contacts) {
+        if (contact.messages) {
+            // 从后往前找（文件消息通常在末尾）
+            for (let i = contact.messages.length - 1; i >= 0; i--) {
+                if (contact.messages[i].transfer_id === transferId) {
+                    return contact.messages[i];
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/** 持久化文件消息到后端 contacts.json（里程碑状态变化时调用，避免每次进度更新都写盘） */
+function saveFileMessage(peerUuid, fileMsg) {
+    if (!peerUuid || !fileMsg || !fileMsg.msg_id) return;
+    controlWs.send(JSON.stringify({
+        type: 'save_message',
+        msg_type: 'file',
+        peer_uuid: peerUuid,
+        sender: fileMsg.from === 'me' ? 'me' : peerUuid,
+        content: '',
+        msg_id: fileMsg.msg_id,
+        file_name: fileMsg.file_name,
+        file_size: fileMsg.file_size,
+        transfer_id: fileMsg.transfer_id,
+        status: fileMsg.status,
+        progress: fileMsg.progress || 0,
+    }));
+}
+
+/** 接收方点击"打开文件"，通过 API 下载/预览 */
+function openDownloadedFile(fileName) {
+    window.open(`/api/downloads/${encodeURIComponent(fileName)}`, '_blank');
 }
 
 // ===== 昵称编辑弹窗 =====
@@ -953,6 +1546,10 @@ function esc(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+/** HTML 属性值转义（用于 onclick="openDownloadedFile('...')" 等场景） */
+function escAttr(text) {
+    return text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 function fmtTime(ts) {
     try {

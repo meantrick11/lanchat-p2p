@@ -31,6 +31,13 @@
         <span>在线用户</span>
         <span class="badge" id="online-count">0</span>
         <button id="btn-scan" class="btn-sm">🔍 扫描</button>
+        <button id="btn-toggle-manual" class="btn-sm" title="手动连接IP" onclick="toggleManualConnect()">➕</button>
+      </div>
+      <div class="panel-input-row" id="manual-connect-row" style="display:none">
+        <input type="text" id="manual-ip-input"
+               placeholder="IP:端口 如 172.21.149.46:50002"
+               autocomplete="off">
+        <button id="btn-manual-connect" class="btn-sm">连接</button>
       </div>
       <div class="panel-list" id="online-list">
         <div class="empty-hint">暂无在线用户</div>
@@ -72,6 +79,7 @@
       <div id="chat-header">
         <span id="chat-peer-name"></span>
         <span id="chat-peer-status"></span>
+        <button id="btn-disconnect" class="btn-sm btn-disconnect" title="断开连接" style="display:none">断开</button>
         <button id="btn-close-chat" class="btn-sm" title="关闭聊天">✕</button>
         <button id="btn-delete-contact" class="btn-sm btn-danger" title="删除联系人">🗑</button>
       </div>

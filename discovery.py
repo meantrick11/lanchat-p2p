@@ -51,23 +51,44 @@ class TokenManager:
         return self.current
 
 
-def _get_broadcast_addresses() -> list[str]:
-    """
-    获取所有活跃网卡的广播地址。
-    优先通过系统接口获取；无法获取时 fallback 到 255.255.255.255。
-    """
-    import struct
-    addresses = []
+# 缓存：网卡信息不会频繁变化，60 秒刷新一次，避免 ipconfig 每 3 秒调一次
+_cached_interfaces: list[tuple[str, str]] | None = None
+_cached_interfaces_time: float = 0
+_CACHE_TTL = 60  # 秒
 
+
+def _get_broadcast_interfaces() -> list[tuple[str, str]]:
+    """
+    获取所有活跃网卡的 (广播地址, 网卡IP) 列表（带缓存）。
+    每张网卡的广播包应携带该网卡自己的 IP，这样多网卡主机在
+    不同子网收到广播的对端才能用正确的 IP 回连。
+
+    Linux: 通过 ioctl 获取准确的 IP + 子网掩码 → 广播地址
+    Windows/fallback: 通过 getaddrinfo 枚举 IP，按 /24 估算广播地址
+    """
+    global _cached_interfaces, _cached_interfaces_time
+
+    now = time.time()
+    if _cached_interfaces is not None and (now - _cached_interfaces_time) < _CACHE_TTL:
+        return _cached_interfaces
+    import struct
+    interfaces = []
+
+    # Linux: ioctl 获取各网卡 IP + 子网掩码，计算定向广播地址
     try:
+        import fcntl
         if hasattr(socket, "if_nameindex"):
-            # Unix-like: 通过 ioctl 获取各网卡 IP 和子网掩码
-            import fcntl
             for iface_name, _ in socket.if_nameindex():
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    ip_bytes = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", iface_name[:15].encode()))[20:24]
-                    mask_bytes = fcntl.ioctl(s.fileno(), 0x891b, struct.pack("256s", iface_name[:15].encode()))[20:24]
+                    ip_bytes = fcntl.ioctl(
+                        s.fileno(), 0x8915,
+                        struct.pack("256s", iface_name[:15].encode())
+                    )[20:24]
+                    mask_bytes = fcntl.ioctl(
+                        s.fileno(), 0x891b,
+                        struct.pack("256s", iface_name[:15].encode())
+                    )[20:24]
                     s.close()
                     ip = socket.inet_ntoa(ip_bytes)
                     netmask = socket.inet_ntoa(mask_bytes)
@@ -75,19 +96,77 @@ def _get_broadcast_addresses() -> list[str]:
                         continue
                     ip_parts = [int(p) for p in ip.split(".")]
                     mask_parts = [int(p) for p in netmask.split(".")]
-                    broadcast_parts = [str(ip_parts[i] | (255 ^ mask_parts[i])) for i in range(4)]
+                    broadcast_parts = [
+                        str(ip_parts[i] | (255 ^ mask_parts[i])) for i in range(4)
+                    ]
                     bcast = ".".join(broadcast_parts)
-                    if bcast not in addresses:
-                        addresses.append(bcast)
+                    if (bcast, ip) not in interfaces:
+                        interfaces.append((bcast, ip))
                 except Exception:
                     continue
+    except (ImportError, OSError):
+        pass
+
+    # Windows / fallback: 枚举所有非回环 IPv4，按 /24 估算广播地址
+    if not interfaces:
+        try:
+            seen = set()
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if ip == "127.0.0.1" or ip in seen:
+                    continue
+                seen.add(ip)
+                parts = ip.split(".")
+                bcast = ".".join(parts[:3]) + ".255"
+                interfaces.append((bcast, ip))
+        except OSError:
+            pass
+
+    # Windows: 通过 ipconfig 获取所有网卡 IP + 子网掩码
+    # （getaddrinfo 可能遗漏虚拟网卡如 VMware Host-Only；正则适配中/英文系统）
+    try:
+        import subprocess
+        import re
+        result = subprocess.run(
+            ["ipconfig"], capture_output=True, text=True, timeout=5
+        )
+        current_ip = None
+        for line in result.stdout.splitlines():
+            # "   IPv4 Address.......: x.x.x.x" / "   IPv4 地址........: x.x.x.x"
+            m_ip = re.search(r'IPv4[^:]*?:\s*([\d.]+)', line)
+            # "   Subnet Mask.......: y.y.y.y" / "   子网掩码.........: y.y.y.y"
+            m_mask = re.search(r'(?:Subnet Mask|子网掩码)[^:]*?:\s*([\d.]+)', line)
+
+            if m_ip:
+                current_ip = m_ip.group(1)
+                if current_ip == "127.0.0.1":
+                    current_ip = None
+            elif m_mask and current_ip:
+                mask = m_mask.group(1)
+                ip_parts = [int(p) for p in current_ip.split(".")]
+                mask_parts = [int(p) for p in mask.split(".")]
+                bcast = ".".join(
+                    [str(ip_parts[i] | (255 ^ mask_parts[i])) for i in range(4)]
+                )
+                if (bcast, current_ip) not in interfaces:
+                    interfaces.append((bcast, current_ip))
+                current_ip = None
     except Exception:
         pass
 
-    # Fallback: 255.255.255.255 受限广播，同子网内可达
-    if not addresses:
-        addresses.append("255.255.255.255")
-    return addresses
+    # 最后的兜底
+    if not interfaces:
+        interfaces.append(("255.255.255.255", "0.0.0.0"))
+
+    _cached_interfaces = interfaces
+    _cached_interfaces_time = time.time()
+    return interfaces
+
+
+# 保留旧函数名的兼容引用
+def _get_broadcast_addresses() -> list[str]:
+    """[兼容] 仅返回广播地址列表（不含网卡 IP）"""
+    return [bcast for bcast, _ in _get_broadcast_interfaces()]
 
 
 class Discovery:
@@ -149,7 +228,7 @@ class Discovery:
         if self._sock:
             # 发送 goodbye
             goodbye = json.dumps({"type": "goodbye", "uuid": self.my_uuid})
-            for bcast_addr in _get_broadcast_addresses():
+            for bcast_addr, _ in _get_broadcast_interfaces():
                 try:
                     self._sock.sendto(goodbye.encode(), (bcast_addr, BROADCAST_PORT))
                 except OSError:
@@ -187,21 +266,22 @@ class Discovery:
     # ===== 内部方法 =====
 
     def _broadcast_heartbeat(self):
-        """发送一次心跳广播到所有广播地址"""
+        """发送一次心跳广播到所有广播地址，每张网卡携带自己的 IP"""
         if not self._sock:
             return
 
-        msg = json.dumps({
-            "type": "hello",
-            "uuid": self.my_uuid,
-            "name": self.my_name,
-            "ip": self.my_ip,
-            "ws_port": self.ws_port,
-            "token": self.token_manager.get_token(),
-            "timestamp": time.time(),
-        })
-
-        for bcast_addr in _get_broadcast_addresses():
+        for bcast_addr, iface_ip in _get_broadcast_interfaces():
+            # 每张网卡使用对应的 IP，保证接收方能从同一子网回连
+            ip = iface_ip if iface_ip != "0.0.0.0" else self.my_ip
+            msg = json.dumps({
+                "type": "hello",
+                "uuid": self.my_uuid,
+                "name": self.my_name,
+                "ip": ip,
+                "ws_port": self.ws_port,
+                "token": self.token_manager.get_token(),
+                "timestamp": time.time(),
+            })
             try:
                 self._sock.sendto(msg.encode(), (bcast_addr, BROADCAST_PORT))
             except OSError:
