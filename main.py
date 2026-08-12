@@ -34,6 +34,7 @@ from storage import (
     delete_progress,
     ensure_data_dir,
     get_contact,
+    get_deleted_uuids,
     get_download_path,
     get_messages,
     list_contacts,
@@ -430,6 +431,7 @@ async def api_me():
         "network": NETWORK_SEGMENT,
         "ws_port": WS_PORT,
         "token": token_manager.get_token(),
+        "deleted_uuids": get_deleted_uuids(),
     }
 
 
@@ -986,6 +988,8 @@ async def ws_chat(ws: WebSocket):
         peer_uuid = msg.get("uuid", "")
         peer_name = msg.get("name", "Unknown")
         peer_token = msg.get("token", "")
+        # 发起方是否曾删除过我们（墓碑）→ 即使我们这边 trusted=true 也要强制重新验证
+        deleted_you = msg.get("deleted_you", False)
 
         # 防止自连：拒绝连接自己
         if peer_uuid == MY_UUID:
@@ -1021,9 +1025,9 @@ async def ws_chat(ws: WebSocket):
 
         # Token 通过 → 判断是新连接还是重连
         # 已知联系人且双方均未删除对方（trusted=true）→ 自动接受，无需用户再次确认
-        # 若对方曾删除过我们（trusted=false）→ 必须重新走确认流程
+        # 若对方曾删除过我们（trusted=false），或对方明确标记 deleted_you → 必须重新走确认流程
         existing_contact = get_contact(peer_uuid)
-        if existing_contact and existing_contact.get("trusted", True):
+        if existing_contact and existing_contact.get("trusted", True) and not deleted_you:
             accepted_result = True
             # 用联系人的最新名字（可能改过昵称）
             peer_name = existing_contact.get("name", peer_name)

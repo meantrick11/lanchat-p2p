@@ -934,6 +934,7 @@ async function autoReconnect(uuid) {
         const resp = await fetch('/api/me');
         const me = await resp.json();
         myInfo.token = me.token;
+        myInfo.deleted_uuids = me.deleted_uuids || [];
     } catch (e) { /* 刷新失败则用现有 token */ }
 
     try {
@@ -948,6 +949,7 @@ async function autoReconnect(uuid) {
                 token: myInfo.token,
                 ip: myInfo.ip,
                 ws_port: myInfo.ws_port,
+                deleted_you: (myInfo.deleted_uuids || []).includes(uuid),
             }));
         };
 
@@ -1014,10 +1016,12 @@ async function connectToPeer(uuid, name, ip) {
     openChat(uuid); // 先打开聊天窗口，显示"连接中..."
 
     // 连接前先刷新自己的 token（token 每3秒更新，避免用过期的）
+    // 同时刷新 deleted_uuids（判断是否删除过对方，重连时需强制对方验证）
     try {
         const resp = await fetch('/api/me');
         const me = await resp.json();
         myInfo.token = me.token;
+        myInfo.deleted_uuids = me.deleted_uuids || [];
     } catch (e) { /* 刷新失败则用现有 token */ }
 
     try {
@@ -1046,6 +1050,7 @@ async function connectToPeer(uuid, name, ip) {
                 token: myInfo.token,
                 ip: myInfo.ip,
                 ws_port: myInfo.ws_port,
+                deleted_you: (myInfo.deleted_uuids || []).includes(uuid),
             }));
         };
 
@@ -1146,6 +1151,7 @@ async function connectByIp(ip, port) {
         const resp = await fetch('/api/me');
         const me = await resp.json();
         myInfo.token = me.token;
+        myInfo.deleted_uuids = me.deleted_uuids || [];
     } catch (e) { /* ignore */ }
 
     try {
