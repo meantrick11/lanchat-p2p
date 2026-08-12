@@ -1025,7 +1025,18 @@ async function connectToPeer(uuid, name, ip) {
         const wsUrl = `ws://${peer.ip}:${peerPort}/ws/chat`;
         const ws = new WebSocket(wsUrl);
 
+        let connectTimeout = setTimeout(() => {
+            if (ws.readyState !== WebSocket.OPEN) {
+                ws.close();
+                activeChats.delete(uuid);
+                markDisconnected(uuid);
+                addSystemMessage(uuid, '连接超时，请检查对方防火墙是否放行 50002 端口');
+                showToast('连接超时，对方可能未放行防火墙');
+            }
+        }, 5000);
+
         ws.onopen = () => {
+            clearTimeout(connectTimeout);
             // 发送连接请求，带上自己的 token 给对方后端验证
             // 对方通过 UDP 广播收到了我的 token，验证是否匹配
             ws.send(JSON.stringify({
@@ -1094,9 +1105,10 @@ async function connectToPeer(uuid, name, ip) {
         };
 
         ws.onerror = () => {
+            clearTimeout(connectTimeout);
             activeChats.delete(uuid);
             markDisconnected(uuid);
-            addSystemMessage(uuid, '连接失败，请检查网络');
+            addSystemMessage(uuid, '连接失败，请检查网络或对方防火墙');
             showToast('连接失败');
             ws.close();
         };
