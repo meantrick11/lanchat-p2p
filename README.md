@@ -7,13 +7,30 @@
 ### 环境要求
 
 - Python 3.13+
-- [uv](https://docs.astral.sh/uv/) 包管理器
+
+### 安装 uv
+
+**Windows（PowerShell）：**
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+**macOS / Linux：**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**pip（通用）：**
+```bash
+pip install uv
+```
 
 ### 安装运行
 
 ```bash
 # 克隆项目
-git clone <your-gitee-repo-url>
+git clone https://github.com/meantrick11/lanchat-p2p
+
 cd internproject
 
 # 安装依赖

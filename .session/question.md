@@ -87,19 +87,7 @@
 
 ---
 
-## 10. 离线时收到的消息怎么处理？
-
-**决定**：等待重连后自动发送。消息保留在待发队列，重连成功后依次发送，对方通过 msg_id 去重。
-
----
-
-## 11. 断连后谁发起重连？
-
-**决定**：A 方自动发起。指数退避重连：1s → 2s → 4s → 8s → 16s → 30s 上限，最多10次。全部失败显示"连接失败，对方可能已下线"。
-
----
-
-## 12. 文件传输重传起点如何确定？
+## 10. 文件传输重传起点如何确定？
 
 **决定**：发送方查询接收方的 `/api/transfer/status/{transfer_id}`，接收方返回 `received_chunks` 位图，发送方找出第一个缺失的 chunk 序号，从该位置继续发送。
 
@@ -110,19 +98,13 @@
 
 ---
 
-## 13. 同名文件如何处理？
+## 11. 同名文件如何处理？
 
 **决定**：自动改名。保存前检查 `data/downloads/` 是否有同名文件，有则改为 `demo(1).mp4`、`demo(2).mp4`。
 
 ---
 
-## 14. 文件传输能否取消？
-
-**决定**：可以。发送方点取消 → 停止发送 → 通过 WS 通知接收方 → 接收方删除 `.part` 和 `.progress` 文件。接收方只有完整接收并校验通过后才显示文件。
-
----
-
-## 15. 多网卡如何处理？
+## 12. 多网卡如何处理？
 
 **决定**：
 - FastAPI 绑定 `0.0.0.0`，监听所有网卡接口
@@ -134,7 +116,7 @@
 
 ---
 
-## 16. 跨子网需要支持吗？
+## 13. 跨子网需要支持吗？
 
 **决定**：基本范围仍是同子网，但增加了**手动 IP 连接 + 自动 HTTP 探活**作为补充。
 
@@ -146,7 +128,7 @@
 
 ---
 
-## 17. 技术栈选择
+## 14. 技术栈选择
 
 | 层 | 选型 | 原因 |
 |----|------|------|
@@ -160,7 +142,7 @@
 
 ---
 
-## 18. 连接请求如何展示？
+## 15. 连接请求如何展示？
 
 **决定**：左侧边栏设置独立区域，在在线用户和历史联系人之间，只在有待处理请求时才出现。橙色 🟠 标识 + 数量徽章。点击 [同意] 自动加入历史联系人 + 打开聊天窗口，点击 [拒绝] 通知对方。所有请求处理完整块隐藏。
 
@@ -168,7 +150,7 @@
 
 ---
 
-## 19. 文件重传机制如何设计？
+## 16. 文件重传机制如何设计？
 
 **决定**：A 通过两种方式感知 B 重新上线（UDP 心跳恢复 + 每5秒主动轮询 GET transfer status）。检测到上线后，先查询进度 → 发 file_request（resume:true）→ B 检查 .progress 匹配则直接确认不弹窗 → A 从断点继续发送。
 
@@ -178,13 +160,13 @@
 
 ---
 
-## 20. 左侧三个列表如何处理内容溢出？
+## 17. 左侧三个列表如何处理内容溢出？
 
 **决定**：各区域标题栏固定，内容区 `overflow-y: auto` 独立滚动。三个区域之间的分割线固定，不随内容增长。
 
 ---
 
-## 21. 其他决策一览
+## 18. 其他决策一览
 
 | 问题 | 决定 |
 |------|------|
@@ -199,7 +181,7 @@
 
 ---
 
-## 22. 同机多实例 UUID 如何区分？
+## 19. 同机多实例 UUID 如何区分？
 
 **决定**：UUID 格式为 `{base_uuid}_{WS_PORT}`。`base_uuid` 从 `config.json` 读取（同机共享），端口后缀确保多实例唯一。
 
@@ -207,7 +189,7 @@
 
 ---
 
-## 23. 手动连接 UI 如何设计？
+## 20. 手动连接 UI 如何设计？
 
 **决定**：在线列表标题栏 `➕` 按钮，点击展开紧凑输入行（IP:端口 + 连接按钮），再次点击收起。
 
@@ -215,7 +197,7 @@
 
 ---
 
-## 24. 如何防止用户连接到自己的实例？
+## 21. 如何防止用户连接到自己的实例？
 
 **决定**：前后端双重检查。
 - 前端 `connectByIp()`：`ip === myInfo.ip && port === myInfo.ws_port` → 拒绝
@@ -224,7 +206,7 @@
 
 ---
 
-## 25. 跨子网 Token 验证失败怎么办？
+## 22. 跨子网 Token 验证失败怎么办？
 
 **决定**：UDP peer_list 验证优先 → 失败则 HTTP GET `/api/me` 反向验证 → 仍失败则拒绝连接。
 
@@ -232,7 +214,7 @@
 
 ---
 
-## 26. 联系人存储是否需要端口信息？
+## 23. 联系人存储是否需要端口信息？
 
 **决定**：需要。`contacts.json` 每条记录增加 `ws_port` 字段，默认 50002。
 
@@ -240,7 +222,7 @@
 
 ---
 
-## 27. 断开连接如何设计？
+## 24. 断开连接如何设计？
 
 **决定**：聊天头部新增「断开」按钮，单方面断开即可，无需对方确认。
 
@@ -253,7 +235,7 @@
 
 ---
 
-## 28. 删除联系人时是否需要断开底层 WS？
+## 25. 删除联系人时是否需要断开底层 WS？
 
 **决定**：需要。删除联系人时应先断开 WS 连接再删除数据。
 
@@ -263,7 +245,7 @@
 
 ---
 
-## 29. 文件发送回退路径（Path 2）如何处理？
+## 26. 文件发送回退路径（Path 2）如何处理？
 
 **决定**：当发送方没有直接 chat WS 时（被动接收方发文件），通过**后端 HTTP relay** 替代原来的 chat WS 直发。
 
@@ -281,7 +263,7 @@
 
 ---
 
-## 30. 聊天消息溢出时如何滚动？
+## 27. 聊天消息溢出时如何滚动？
 
 **决定**：使用 flex 布局 + `overflow-y: auto` 实现消息区独立滚动。
 
@@ -291,3 +273,163 @@
 - `#chat-container` 和 `#chat-messages` 均设置 `min-height: 0`
 - `#chat-messages > .msg` 设置 `flex-shrink: 0`，防止 flex 压缩消息导致文件气泡消失
 - JS 中 `scrollTop` 改用 `requestAnimationFrame` 回调，等 flex 重排完成后再滚动到底部
+
+---
+
+## 28. 文件重传时如何避免重复弹窗确认？
+
+**决定**：发送方发起重传时携带 `resume: true`，接收方后端检测到 `.progress` 文件存在且 `resume` 为 true → 自动接受，不弹窗。
+
+**问题**：初版重传有 5 个缺陷：
+1. HTTP POST 请求体没有传 `resume` 字段 → 接收方无法判断是首次请求还是续传
+2. `_relay_from_peer` 全量覆盖 `transfers[transfer_id]` 导致已接收的 `received_chunks` 丢失
+3. `handleConnectionEstablished` 覆盖联系人时 `messages: []` 擦除了历史
+4. 接受时重复 push 文件消息 → 聊天区出现两条同内容的气泡
+5. retry 无连接时静默失败 → transfer 数据被误删
+
+**修复**：5 处逐一修复（详见 process.md §22），确保重传链路完整。
+
+---
+
+## 29. 为什么所有 WebSocket onclose 回调都要中止文件上传？
+
+**决定**：`abortTransfersForPeer()` 必须在每个 chat WS 的 `onclose` 回调中调用，而不仅限于 `disconnectCurrentChat()` 和 `handlePeerDisconnected()`。
+
+**原因**：
+- `disconnectCurrentChat()`：只在**主动方点击"断开"按钮**时触发，覆盖发送方主动断开场景
+- `handlePeerDisconnected()`：只在**后端通过 control WS 通知**时触发，覆盖接收方的 incoming WS 被后端关闭场景
+- `ws.onclose`：chat WS **以任何方式关闭**都会触发（网络闪断、浏览器关标签页、对方后端重启等），是最兜底的路径
+
+项目中 4 处 `onclose`（`connectToPeer`、`autoReconnect`、`connectByIp`×2）原来都没有调用 abort，导致接收方断开连接后发送方 HTTP POST 上传继续跑而不自停。修复后在每个 onclose 中统一调用 `abortTransfersForPeer(uuid)`。
+
+---
+
+## 30. 断开连接时检查哪些文件传输？
+
+**决定**：断开连接的文件传输警告应同时检查**发送中的**（`pendingFileTransfers`）和**接收中的**（`contact.messages` 中 `from !== 'me'` 且状态为 `downloading`/`waiting` 的文件消息）。
+
+**原因**：`pendingFileTransfers` 只记录本端作为发送方的上传任务。当用户是接收方时，该 Map 中没有对应条目，原有检查无效——接收方断开时不会看到任何文件传输警告。
+
+**修复**：`disconnectCurrentChat()` 改为两步检查——先查 `pendingFileTransfers`（发送中），再查 `contact.messages`（接收中），任一命中即弹出警告确认框。
+
+---
+
+## 31. 已在线节点改名/IP 变化为什么对方不更新？
+
+**决定**：UDP 心跳的 `on_peer_online` 回调应在 name 或 ip 变化时也触发，而不仅限于 `is_new` 或 `was_offline`。
+
+**问题**：`discovery._handle_message()` 只在"第一次见到 UUID"或"从离线恢复"时触发回调。已在线且一直在线时，即使心跳中的 name/ip 已变化，回调也不触发。这导致：
+- `_notify_peer_online()` 不执行 → `contacts.json` 不更新
+- 前端收不到 `peer_online` → UI 永远显示旧数据
+- 刷新页面也无效（`contacts.json` 未更新）
+
+**修复**（`discovery.py`）：
+```python
+name_changed = msg.get("name") != prev_data.get("name")
+ip_changed = msg.get("ip") != prev_data.get("ip")
+updated = name_changed or ip_changed
+if self.on_peer_online and (is_new or was_offline or updated):
+    self.on_peer_online(self._peers[uuid].copy())
+```
+
+**同时**（`app.js`）：`handlePeerOnline()` 原来只更新 `contacts.status`，现同步更新 `name` 和 `ip`。
+
+---
+
+## 32. UDP 发现的所有人都该写入历史联系人吗？
+
+**决定**：不应该。UDP 发现仅用于更新**已存联系人**的在线状态和 name/IP，不应把陌生节点写入 `contacts.json`。
+
+**原因**：历史联系人 = 真正建立过联系的人（聊天过、连接过）。局域网内可能有很多设备广播 UDP，但大多数与你无关。如果每个广播都写入历史联系人，列表会越来越臃肿，且"小林现象"（从未连接过的人也出现在历史联系人中）不符合用户预期。
+
+**修复**（`main.py`）：`_notify_peer_online()` 中 `upsert_contact()` 改为先 `get_contact()` 检查存在性，不存在则跳过写入：
+```python
+if get_contact(peer["uuid"]):
+    upsert_contact(...)
+```
+
+**分层逻辑**：
+- **在线用户面板**：UDP 发现的所有节点，实时显示
+- **历史联系人列表**：`contacts.json` 中已存的节点 + 建立连接时写入的新节点
+- **UDP 发现**：不创建新联系人，只更新已存联系人的 name/ip/状态
+
+---
+
+## 33. 如何判断是否有活跃的文件传输？
+
+**决定**：双维度检查 + 过滤 stale state。
+
+**维度 1 — 发送方**：检查 `pendingFileTransfers`，但需排除 `t.aborted === true` 的条目。中断传输时设置 `aborted = true` 但保留条目供续传，由此产生的"僵尸条目"不应误报。
+
+**维度 2 — 接收方**：检查 `contact.messages` 中 `from !== 'me'` 且 `status` 为 `'downloading'` 或 `'waiting'` 的文件消息。传输中断时 `abortTransfersForPeer` 会将这类消息标记为 `'failed'`，防止下次断开时误报。
+
+**状态清理**：`abortTransfersForPeer` 负责两件事——中止发送（`t.aborted = true`）+ 标记接收（`status → 'failed'`）。所有断开路径（disconnectCurrentChat、onclose、handlePeerDisconnected）统一走此函数。
+
+---
+
+## 34. 路径穿越如何防御？
+
+**决定**：两层纵深防御。
+
+**第一层 — 入口净化**：`api_transfer_request`、`_relay_from_peer`、`_handle_file_request_from_browser` 三处用 `Path(file_name).name` 只取文件名，丢弃所有目录成分。`../../../Windows/evil.exe` → `evil.exe`。
+
+**第二层 — 核心防线**：`get_download_path()` 对最终路径做 `.resolve()` 后检查是否在 `DOWNLOADS_DIR.resolve()` 内。即使用 `.resolve()` 消除 `..` 后路径逃逸也会被 `startswith` 检查拦截。
+
+**原因**：`Path / "../"` 不会自动消除 `..`，必须显式 `.resolve()`。与已有的 `download_file` 端点防护一致。
+
+---
+
+## 35. 文件传输 HTTP API 为什么要加 Token 验证？
+
+**决定**：`POST /api/transfer/request`、`/api/transfer/chunk`、`/api/transfer/complete` 三个端点均加 token 验证，模式与 `ws_chat` 一致。
+
+**原因**：这三个端点是 P2P 架构的后端-后端/browser-后端 relay 接口，但设计时漏掉了身份验证。内网任何人都可以无认证调用：
+- `/api/transfer/request` → 刷屏弹窗（每次触发 `incoming_file_request` 通知）
+- `/api/transfer/chunk` + `/api/transfer/complete` → 写垃圾数据、提前完成传输
+
+**验证流程**：`discovery.verify_token(uuid, token)` 优先 → 失败则 `_verify_token_via_api` HTTP 反向验证 → 仍失败返回 403。
+
+---
+
+## 36. 三个 CRITICAL Bug 的原因和影响
+
+**CRITICAL #3 — contacts.json 读写竞态**：`upsert_contact` 和 `delete_contact` 在 load 和 save 之间释放了锁，并发写入导致数据丢失。修复：锁覆盖整个读→改→写周期。
+
+**CRITICAL #4 — 文件消息写入错误联系人**：`handleTransferComplete`/`handleTransferCancelled` 使用 `currentChat`（当前显示窗口）而非文件消息实际所属联系人的 UUID。如果你在看 Alice 的聊天，Bob 的文件传完了，Bob 的文件消息会被写进 Alice 的数据。修复：`findFileMsgByTransferId` 返回 `{msg, peerUuid}`，调用方精确使用。
+
+**CRITICAL #5 — 接受连接后联系人未落盘**：`respondConnection` 只存内存 Map，不发 `save_contact`。刷新/重启后联系人消失。修复：追加 `save_contact` control WS 消息。
+
+---
+
+## 37. WS 连接超时策略
+
+**决定**：
+- **连接请求超时**：1 分钟。用户不操作则自动拒绝，释放协程和 `pending_connections` 条目。
+- **空闲连接超时**：10 分钟无消息且无活跃文件传输则关闭连接。文件传输进行中（`transfers` 中有 `status=="receiving"` 且 `from_uuid` 匹配）时跳过超时检查。
+
+**原因**：`confirmed_event.wait()` 和 `ws.receive_json()` 均无超时，协程永久阻塞，内存泄漏。
+
+**实现**：`asyncio.wait_for()` 包装，超时后分别通知双方浏览器清理状态。`idle_closed` 标志位防止 `finally` 块重复发 `peer_disconnected`。
+
+---
+
+## 38. readAsBase64 为什么不 reject？
+
+**决定**：Promise 加 `reject` 回调 + `reader.onerror` 处理。调用方 `startChunkUpload` 加 try/catch 兜底。
+
+**原因**：原代码 `new Promise((resolve) => ...)` 只有 resolve，没有 reject。`FileReader` 读盘失败（权限变更、文件被删、磁盘错误）时 Promise 永不 settle，上传循环在 `await readAsBase64(blob)` 处永久挂起。
+
+---
+
+## 39. 未连接时发送消息/文件应如何处理？
+
+**决定**：输入框和按钮始终可用（不 disabled），在发送/选文件/重传的入口处检查连接状态，未通过则弹居中提示。
+
+**原因**：disabled 控件让用户不知道"为什么不能发"和"该怎么办"。允许用户先输入内容、选文件，点击发送时才阻断并提示，告知明确的下一步操作。
+
+**实现**：新增 `showCenterToast()` — 白底黑字 + 阴影，屏幕正中央弹出（`scale 0.88→1`）后渐隐，1.75s 自动消失。
+
+**提示文案策略**：
+- 离线 → "对方当前不在线，等待对方上线后才能聊天嗷~"
+- 在线未连接 → "连接按钮都懒得点，那就别想和我聊天~"
+- 重传分支使用同风格但区分场景的文案

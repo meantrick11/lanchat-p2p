@@ -106,29 +106,35 @@ def upsert_contact(uuid: str, name: str, ip: str, ws_port: int = 50002):
     添加或更新联系人基本信息（不覆盖 messages）。
     首次接触时记录 first_contact，每次更新 last_contact。
     ws_port 用于跨子网 HTTP 探活时知道对方监听端口。
+    重连时重置 trusted 为 true（对方已重新验证通过）。
+
+    线程安全：锁覆盖读→改→写全周期，防止并发导致数据丢失。
     """
-    contacts = load_contacts()
-    now = datetime.now().isoformat()
+    with _contacts_lock:
+        contacts = _load_contacts_unsafe()
+        now = datetime.now().isoformat()
 
-    if uuid not in contacts:
-        contacts[uuid] = {
-            "name": name,
-            "ip": ip,
-            "ws_port": ws_port,
-            "first_contact": now,
-            "last_contact": now,
-            "messages": [],
-        }
-    else:
-        contacts[uuid]["name"] = name
-        contacts[uuid]["ip"] = ip
-        contacts[uuid]["ws_port"] = ws_port
-        contacts[uuid]["last_contact"] = now
-        # 如果旧数据没有 messages 字段，补上
-        if "messages" not in contacts[uuid]:
-            contacts[uuid]["messages"] = []
+        if uuid not in contacts:
+            contacts[uuid] = {
+                "name": name,
+                "ip": ip,
+                "ws_port": ws_port,
+                "first_contact": now,
+                "last_contact": now,
+                "messages": [],
+                "trusted": True,
+            }
+        else:
+            contacts[uuid]["name"] = name
+            contacts[uuid]["ip"] = ip
+            contacts[uuid]["ws_port"] = ws_port
+            contacts[uuid]["last_contact"] = now
+            contacts[uuid]["trusted"] = True  # 重连后恢复信任
+            # 如果旧数据没有 messages 字段，补上
+            if "messages" not in contacts[uuid]:
+                contacts[uuid]["messages"] = []
 
-    save_contacts(contacts)
+        _save_contacts_unsafe(contacts)
 
 
 def append_message(uuid: str, sender: str, content: str, msg_id: str,
@@ -210,12 +216,22 @@ def get_messages(uuid: str) -> list[dict]:
     return []
 
 
+def mark_contact_untrusted(uuid: str):
+    """将联系人标记为不可信（对方删除了我们，下次重连需重新验证）"""
+    with _contacts_lock:
+        contacts = _load_contacts_unsafe()
+        if uuid in contacts:
+            contacts[uuid]["trusted"] = False
+            _save_contacts_unsafe(contacts)
+
+
 def delete_contact(uuid: str):
-    """删除指定联系人及其聊天记录"""
-    contacts = load_contacts()
-    if uuid in contacts:
-        del contacts[uuid]
-        save_contacts(contacts)
+    """删除指定联系人及其聊天记录（线程安全）"""
+    with _contacts_lock:
+        contacts = _load_contacts_unsafe()
+        if uuid in contacts:
+            del contacts[uuid]
+            _save_contacts_unsafe(contacts)
 
 
 def list_contacts() -> list[dict]:
@@ -230,6 +246,7 @@ def list_contacts() -> list[dict]:
             "ws_port": info.get("ws_port", 50002),
             "first_contact": info.get("first_contact", ""),
             "last_contact": info.get("last_contact", ""),
+            "trusted": info.get("trusted", True),
             "message_count": len(info.get("messages", [])),
         })
     # 按最后联系时间倒序排列
@@ -287,9 +304,19 @@ def get_download_path(file_name: str) -> Path:
     获取下载文件路径，自动处理同名冲突。
     demo.mp4 → demo.mp4 (无冲突)
     demo.mp4 → demo(1).mp4 (有冲突)
+
+    安全防护：resolve() 后检查路径必须在 DOWNLOADS_DIR 内，防止路径穿越攻击。
+    同时对 file_name 做 sanitize，只取文件名部分，丢弃目录成分。
     """
     ensure_data_dir()
-    target = DOWNLOADS_DIR / file_name
+    # 只取文件名，丢弃任何目录成分（防御路径穿越的第一层）
+    safe_name = Path(file_name).name
+    target = (DOWNLOADS_DIR / safe_name).resolve()
+    allowed_base = DOWNLOADS_DIR.resolve()
+    if not str(target).startswith(str(allowed_base)):
+        raise ValueError(f"非法的文件路径: {file_name}")
+
+    # 生成目标路径时也使用 resolve 后的 safe_name，避免后续拼接触发穿越
     if not target.exists():
         return target
 
@@ -298,9 +325,11 @@ def get_download_path(file_name: str) -> Path:
     counter = 1
     while True:
         new_name = f"{stem}({counter}){suffix}"
-        target = DOWNLOADS_DIR / new_name
-        if not target.exists():
-            return target
+        candidate = (DOWNLOADS_DIR / new_name).resolve()
+        if not str(candidate).startswith(str(allowed_base)):
+            raise ValueError(f"非法的文件路径: {new_name}")
+        if not candidate.exists():
+            return candidate
         counter += 1
 
 

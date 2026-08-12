@@ -335,10 +335,12 @@ class Discovery:
                     "status": "online",
                 }
 
-                # 触发上线回调
-                if is_new and self.on_peer_online:
-                    self.on_peer_online(self._peers[uuid].copy())
-                elif was_offline and self.on_peer_online:
+                # 触发上线/更新回调
+                # ① 新节点 ② 从离线恢复 ③ 已在线但 name/IP 变化 → 都通知前端
+                name_changed = msg.get("name") != prev_data.get("name")
+                ip_changed = msg.get("ip") != prev_data.get("ip")
+                updated = name_changed or ip_changed
+                if self.on_peer_online and (is_new or was_offline or updated):
                     self.on_peer_online(self._peers[uuid].copy())
 
             elif msg_type == "goodbye":

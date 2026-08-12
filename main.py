@@ -33,6 +33,7 @@ from storage import (
     delete_contact,
     delete_progress,
     ensure_data_dir,
+    get_contact,
     get_download_path,
     get_messages,
     list_contacts,
@@ -91,6 +92,54 @@ def get_local_ip() -> str:
     except OSError:
         pass
 
+    # 方法4：通过系统命令获取本机 IP（Linux hostname -I / ip addr / Windows ipconfig）
+    try:
+        import subprocess
+        import re
+
+        # 4a. Linux: hostname -I（输出所有非回环 IP，空格分隔，最简洁可靠）
+        try:
+            result = subprocess.run(
+                ["hostname", "-I"], capture_output=True, text=True, timeout=3
+            )
+            ips = result.stdout.strip().split()
+            for ip in ips:
+                if ip and ip != "127.0.0.1" and not ip.startswith("169.254."):
+                    return ip
+        except Exception:
+            pass
+
+        # 4b. Linux: ip addr show（备选，解析 inet 地址）
+        try:
+            result = subprocess.run(
+                ["ip", "addr", "show"], capture_output=True, text=True, timeout=3
+            )
+            for line in result.stdout.splitlines():
+                m = re.search(r'inet\s+([\d.]+)', line)
+                if m:
+                    ip = m.group(1)
+                    if ip and ip != "127.0.0.1" and not ip.startswith("169.254."):
+                        return ip
+        except Exception:
+            pass
+
+        # 4c. Windows: ipconfig（适配虚拟机仅主机模式等场景）
+        try:
+            result = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                m = re.search(r'IPv4[^:]*?:\s*([\d.]+)', line)
+                if m:
+                    ip = m.group(1)
+                    if ip and ip != "127.0.0.1" and not ip.startswith("169.254."):
+                        return ip
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
     return "127.0.0.1"
 
 
@@ -119,7 +168,9 @@ if not config.get("uuid"):
     save_config(config)
 
 # 找到可用端口（必须在 MY_UUID 之前，因为 UUID 需要带上端口防同机冲突）
-WS_PORT: int = find_available_port()
+# 如果设置了 LANCHAT_PORT 环境变量则直接使用，否则自动查找（同机多实例需手动指定避免竞态）
+_env_port = os.environ.get("LANCHAT_PORT", "")
+WS_PORT: int = int(_env_port) if _env_port else find_available_port()
 
 MY_UUID: str = f"{config['uuid']}_{WS_PORT}"  # 端口后缀确保同机多实例 UUID 唯一
 MY_NAME: str = config.get("name", socket.gethostname())
@@ -308,6 +359,12 @@ app.add_middleware(
 
 async def _notify_peer_online(peer: dict):
     """discovery 回调：节点上线 → 通知浏览器（含 token，供前端建立连接时出示）"""
+    # 只在历史联系人已存在时才更新 name/ip（不把 UDP 发现的每个人都写入历史联系人）
+    if get_contact(peer["uuid"]):
+        upsert_contact(
+            peer["uuid"], peer["name"],
+            peer.get("ip", ""), peer.get("ws_port", 50002),
+        )
     if control_ws:
         try:
             await control_ws.send_json({
@@ -482,6 +539,7 @@ async def ws_control(ws: WebSocket):
         "token": token_manager.get_token(),
         "contacts": init_contacts,
         "online_peers": online_peers_list,
+        "active_peers": list(active_chats.keys()),
     })
 
     try:
@@ -546,11 +604,58 @@ async def ws_control(ws: WebSocket):
                 if uuid:
                     upsert_contact(uuid, name, ip_addr, ws_port)
 
-            elif msg_type == "delete_contact":
-                # 浏览器请求删除联系人
+            elif msg_type == "mark_untrusted":
+                # 浏览器请求将某联系人标记为不可信（对方删除了我们）
                 uuid = msg.get("uuid", "")
                 if uuid:
+                    from storage import mark_contact_untrusted
+                    mark_contact_untrusted(uuid)
+                    await _notify_browser({
+                        "type": "contact_untrusted",
+                        "uuid": uuid,
+                    })
+
+            elif msg_type == "delete_contact":
+                # 浏览器请求删除联系人 → 清理所有关联数据
+                uuid = msg.get("uuid", "")
+                if uuid:
+                    # 0. 通知对端标记我们为不可信（不删数据，只设 trusted=false）
+                    #    这样后续任一方重连都需要重新验证
+                    with _chats_lock:
+                        peer_ws = active_chats.get(uuid)
+                    if peer_ws:
+                        try:
+                            await _safe_send(peer_ws, {
+                                "type": "contact_untrusted",
+                                "uuid": MY_UUID,
+                                "name": MY_NAME,
+                            })
+                        except Exception:
+                            pass
+
+                    # 1. 关闭与该对端的活跃聊天连接
+                    with _chats_lock:
+                        peer_ws = active_chats.pop(uuid, None)
+                    if peer_ws:
+                        try:
+                            await peer_ws.close()
+                        except Exception:
+                            pass
+                    # 2. 清理待确认的连接请求
+                    with _pending_lock:
+                        pending_connections.pop(uuid, None)
+                    # 3. 清理进行中的文件传输
+                    for tid, t in list(transfers.items()):
+                        if t.get("from_uuid") == uuid or t.get("to_uuid") == uuid:
+                            transfers.pop(tid, None)
+                            delete_progress(tid)
+                    # 4. 删除联系人及聊天记录
                     delete_contact(uuid)
+                    # 5. 通知浏览器状态已清理
+                    await _notify_browser({
+                        "type": "contact_deleted",
+                        "uuid": uuid,
+                    })
 
     except WebSocketDisconnect:
         control_ws = None
@@ -731,12 +836,14 @@ async def _handle_file_request_from_browser(msg: dict):
             url = f"http://{peer['ip']}:{peer.get('ws_port', 50002)}/api/transfer/request"
             payload = _json.dumps({
                 "transfer_id": transfer_id,
-                "file_name": msg.get("file_name", ""),
+                "file_name": Path(msg.get("file_name", "")).name,
                 "file_size": msg.get("file_size", 0),
                 "chunk_size": msg.get("chunk_size", 65536),
                 "total_chunks": msg.get("total_chunks", 0),
                 "from_uuid": MY_UUID,
                 "from_name": MY_NAME,
+                "token": token_manager.get_token(),
+                "resume": msg.get("resume", False),
             }).encode("utf-8")
             req = _urllib.Request(url, data=payload, headers={"Content-Type": "application/json"})
             with _urllib.urlopen(req, timeout=5) as resp:
@@ -759,7 +866,7 @@ async def _handle_file_request_from_browser(msg: dict):
                     "file_size": msg.get("file_size", 0),
                     "chunk_size": msg.get("chunk_size", 65536),
                     "total_chunks": msg.get("total_chunks", 0),
-                    "resume": False,
+                    "resume": msg.get("resume", False),
                 })
             else:
                 await _notify_browser({
@@ -865,6 +972,7 @@ async def ws_chat(ws: WebSocket):
     peer_name: str = "Unknown"
     confirmed_event = asyncio.Event()
     accepted_result: bool = False
+    idle_closed: bool = False  # 空闲超时关闭，避免 finally 中重复通知
 
     try:
         # ===== 阶段1：连接请求与 Token 验证 =====
@@ -906,42 +1014,75 @@ async def ws_chat(ws: WebSocket):
                 "last_seen": time.time(), "miss_count": 0, "status": "online",
             }
 
-        # Token 通过 → 加入待确认列表（带 asyncio.Event，供 control WS 回调通知）
-        with _pending_lock:
-            pending_connections[peer_uuid] = {
-                "ws": ws,
-                "name": peer_name,
-                "uuid": peer_uuid,
-                "event": confirmed_event,
-                "accepted": False,
-            }
-
-        # 获取发起方 IP 和端口，以便接收方同意后反向建立连接
-        # 同子网优先用 UDP 广播里的信息（含 token），跨子网用 connect_request 里的
+        # 获取发起方 IP 和端口，同子网优先用 UDP 广播里的信息（含 token）
         peer_info = discovery.get_peer(peer_uuid) or {}
         peer_ip = peer_info.get("ip", "") or peer_ip
         peer_ws_port = peer_info.get("ws_port", 50002) or peer_ws_port
 
-        await _notify_browser({
-            "type": "incoming_connection",
-            "uuid": peer_uuid,
-            "name": peer_name,
-            "ip": peer_ip,
-            "ws_port": peer_ws_port,
-        })
-        await _notify_pending_update()
+        # Token 通过 → 判断是新连接还是重连
+        # 已知联系人且双方均未删除对方（trusted=true）→ 自动接受，无需用户再次确认
+        # 若对方曾删除过我们（trusted=false）→ 必须重新走确认流程
+        existing_contact = get_contact(peer_uuid)
+        if existing_contact and existing_contact.get("trusted", True):
+            accepted_result = True
+            # 用联系人的最新名字（可能改过昵称）
+            peer_name = existing_contact.get("name", peer_name)
+            # 直接发送 connect_accepted，跳过用户确认环节
+            await ws.send_json({
+                "type": "connect_accepted",
+                "uuid": MY_UUID,
+                "name": MY_NAME,
+                "ip": MY_IP,
+                "ws_port": WS_PORT,
+            })
+        else:
+            # 新连接或对方曾删除过我们 → 加入待确认列表，等待用户确认
+            with _pending_lock:
+                pending_connections[peer_uuid] = {
+                    "ws": ws,
+                    "name": peer_name,
+                    "uuid": peer_uuid,
+                    "event": confirmed_event,
+                    "accepted": False,
+                }
 
-        # 等待用户通过 control WS 发来 connection_response
-        await confirmed_event.wait()
+            await _notify_browser({
+                "type": "incoming_connection",
+                "uuid": peer_uuid,
+                "name": peer_name,
+                "ip": peer_ip,
+                "ws_port": peer_ws_port,
+            })
+            await _notify_pending_update()
 
-        # 检查是否被接受
-        with _pending_lock:
-            info = pending_connections.pop(peer_uuid, {})
-            accepted_result = info.get("accepted", False)
+            # 等待用户通过 control WS 发来 connection_response（1分钟超时）
+            try:
+                await asyncio.wait_for(confirmed_event.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                # 用户1分钟内未操作 → 拒绝连接，清理资源
+                with _pending_lock:
+                    pending_connections.pop(peer_uuid, None)
+                await _notify_browser({
+                    "type": "connection_timeout",
+                    "uuid": peer_uuid,
+                    "name": peer_name,
+                })
+                await _notify_pending_update()
+                try:
+                    await ws.send_json({"type": "connect_rejected", "reason": "timeout"})
+                except Exception:
+                    pass
+                await ws.close()
+                return
 
-        if not accepted_result:
-            await ws.close()
-            return
+            # 检查是否被接受
+            with _pending_lock:
+                info = pending_connections.pop(peer_uuid, {})
+                accepted_result = info.get("accepted", False)
+
+            if not accepted_result:
+                await ws.close()
+                return
 
         # ===== 阶段2：正常消息收发 =====
         with _chats_lock:
@@ -961,7 +1102,29 @@ async def ws_chat(ws: WebSocket):
         await _notify_pending_update()
 
         while True:
-            msg = await ws.receive_json()
+            try:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=600)
+            except asyncio.TimeoutError:
+                # 10分钟无消息 → 检查是否有活跃的文件传输
+                has_active_transfer = any(
+                    t.get("from_uuid") == peer_uuid and t.get("status") == "receiving"
+                    for t in transfers.values()
+                )
+                if has_active_transfer:
+                    continue  # 文件传输进行中，不关闭
+
+                await _notify_browser({
+                    "type": "connection_idle_close",
+                    "uuid": peer_uuid,
+                    "name": peer_name,
+                })
+                idle_closed = True
+                try:
+                    await ws.send_json({"type": "connection_closing", "reason": "idle_timeout"})
+                except Exception:
+                    pass
+                break
+
             await _relay_from_peer(ws, peer_uuid, peer_name, msg)
 
     except WebSocketDisconnect:
@@ -974,7 +1137,8 @@ async def ws_chat(ws: WebSocket):
             pending_connections.pop(peer_uuid, None)
         with _chats_lock:
             active_chats.pop(peer_uuid, None)
-        if peer_uuid:
+        if peer_uuid and not idle_closed:
+            # 空闲超时已通过 connection_idle_close 通知，避免重复
             await _notify_browser({
                 "type": "peer_disconnected",
                 "uuid": peer_uuid,
@@ -1011,10 +1175,15 @@ async def _relay_from_peer(ws: WebSocket, peer_uuid: str, peer_name: str, msg: d
 
     elif msg_type == "file_request":
         transfer_id = msg.get("transfer_id", "")
-        file_name = msg.get("file_name", "")
+        file_name = Path(msg.get("file_name", "")).name
         file_size = msg.get("file_size", 0)
         resume = msg.get("resume", False)
         existing_progress = load_progress(transfer_id)
+
+        # 保留旧传输中已收到的分片数据（续传覆盖时不丢失进度）
+        old_transfer = transfers.get(transfer_id, {})
+        old_received_chunks = old_transfer.get("received_chunks", [])
+        old_received_bytes = old_transfer.get("received_bytes", 0)
 
         transfers[transfer_id] = {
             "transfer_id": transfer_id,
@@ -1024,6 +1193,8 @@ async def _relay_from_peer(ws: WebSocket, peer_uuid: str, peer_name: str, msg: d
             "chunk_size": msg.get("chunk_size", 65536),
             "from_uuid": peer_uuid,
             "from_name": peer_name,
+            "received_chunks": old_received_chunks,
+            "received_bytes": old_received_bytes,
             "status": "receiving" if (resume and existing_progress) else "pending",
             "created_at": datetime.now().isoformat(),
         }
@@ -1042,7 +1213,8 @@ async def _relay_from_peer(ws: WebSocket, peer_uuid: str, peer_name: str, msg: d
                 "from_name": peer_name,
             })
         else:
-            # 新传输 → 弹窗
+            # 新传输或续传但进度文件丢失 → 通知浏览器
+            # 若 sender 标记了 resume，浏览器应自动接受（不弹窗）
             await _notify_browser({
                 "type": "incoming_file_request",
                 "transfer_id": transfer_id,
@@ -1050,6 +1222,7 @@ async def _relay_from_peer(ws: WebSocket, peer_uuid: str, peer_name: str, msg: d
                 "file_size": file_size,
                 "from_uuid": peer_uuid,
                 "from_name": peer_name,
+                "resume": resume,
             })
 
     elif msg_type == "file_response":
@@ -1089,13 +1262,27 @@ async def api_transfer_request(request: Request):
     """
     data = await request.json()
     transfer_id = data.get("transfer_id", "")
-    file_name = data.get("file_name", "")
+    file_name = Path(data.get("file_name", "")).name
     file_size = data.get("file_size", 0)
     from_uuid = data.get("from_uuid", "")
     from_name = data.get("from_name", "")
+    from_token = data.get("token", "")
+    resume = data.get("resume", False)
 
     if not transfer_id or not from_uuid:
         raise HTTPException(400, "缺少必要参数")
+
+    # Token 验证：防止未认证的请求刷屏弹窗
+    if not discovery.verify_token(from_uuid, from_token):
+        peer_info = discovery.get_peer(from_uuid) or {}
+        peer_ip = peer_info.get("ip", "")
+        peer_ws_port = peer_info.get("ws_port", 50002)
+        if not peer_ip or not await _verify_token_via_api(from_uuid, from_token, peer_ip, peer_ws_port):
+            raise HTTPException(403, "token 验证失败")
+
+    # 续传：已有进度文件则自动进入接收状态，跳过用户确认
+    existing_progress = load_progress(transfer_id)
+    status = "receiving" if (resume and existing_progress) else "pending"
 
     transfers[transfer_id] = {
         "transfer_id": transfer_id,
@@ -1105,7 +1292,7 @@ async def api_transfer_request(request: Request):
         "chunk_size": data.get("chunk_size", 65536),
         "from_uuid": from_uuid,
         "from_name": from_name,
-        "status": "pending",
+        "status": status,
         "created_at": datetime.now().isoformat(),
     }
 
@@ -1116,6 +1303,8 @@ async def api_transfer_request(request: Request):
         "file_size": file_size,
         "from_uuid": from_uuid,
         "from_name": from_name,
+        # 用发送方的 resume 意图（即使进度文件丢失，浏览器也应自动接受不弹窗）
+        "resume": resume or status == "receiving",
     })
 
     return {"status": "ok"}
@@ -1135,6 +1324,9 @@ async def transfer_chunk(request: Request):
     if t.get("status") not in ("receiving",):
         raise HTTPException(400, f"传输状态异常: {t.get('status')}")
 
+    # chunk 不验证 token：传输请求阶段已认证，transfer_id 不可猜测，
+    # token 每 3 秒刷新会导致竞态条件（发送端取 token → 心跳刷新 → 接收端验证失败）
+
     try:
         chunk_data = base64.b64decode(chunk_data_b64)
     except Exception:
@@ -1146,12 +1338,18 @@ async def transfer_chunk(request: Request):
 
     lock = transfer_locks.setdefault(transfer_id, threading.Lock())
     with lock:
-        with open(part_path, "ab") as f:
+        # 使用 "r+b"（已存在）或 "w+b"（新建），绝不使用 "ab"。
+        # "ab" 模式下 f.seek() 对 write 无效，OS 强制所有写入追加到文件末尾，
+        # 导致续传时分片被错误拼接，文件大小膨胀 → "文件校验出错"。
+        _mode = "r+b" if part_path.exists() else "w+b"
+        with open(part_path, _mode) as f:
             f.seek(chunk_index * chunk_size)
             f.write(chunk_data)
 
-        t.setdefault("received_chunks", []).append(chunk_index)
-        t["received_bytes"] = t.get("received_bytes", 0) + len(chunk_data)
+        # 去重：续传时发送方可能从 0 开始重发，已收到的分片不重复计数
+        if chunk_index not in t.setdefault("received_chunks", []):
+            t["received_chunks"].append(chunk_index)
+            t["received_bytes"] = t.get("received_bytes", 0) + len(chunk_data)
 
         # 持久化进度
         save_progress(transfer_id, {
@@ -1192,6 +1390,8 @@ async def transfer_complete(request: Request):
     t = transfers.get(transfer_id)
     if not t:
         raise HTTPException(404, "传输不存在")
+
+    # complete 不验证 token：传输请求阶段已认证，与 chunk 同理
 
     part_path = get_download_path(t["file_name"])
     part_path = part_path.with_suffix(part_path.suffix + ".part")

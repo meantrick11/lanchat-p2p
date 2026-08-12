@@ -75,7 +75,7 @@ B（接收方）→ A：
 - `updateOnlinePeers`：每次更新后同步调用 `renderContactsList()` 和 `updateChatHeaderStatus()`
 - `updateChatHeaderStatus`：统一控制聊天头部文字、输入框和发送按钮的 disabled 状态
 - init 消息增加 `online_peers` 字段，后端在 WS 连接时即下发当前在线节点
-- 离线联系人点击：弹出"对方不在线"提示 + 加载历史记录（只读）
+- 离线联系人点击：打开聊天窗口并加载历史记录，输入框始终可用，发送时弹居中提示
 
 ### 设计流程总结
 
@@ -97,9 +97,8 @@ B（接收方）→ A：
   → 双向消息：主动方走 chat WS，被动方走 control WS + 复用 chat WS
 
 点击离线联系人（红色🔴）
-  → 弹出"对方不在线"
   → 打开聊天窗口，加载 /api/messages/{uuid} 历史记录
-  → 输入框禁用（只读模式）
+  → 输入框始终可用，发送/选文件时弹出居中提示引导操作（见 §32）
 ```
 
 **文件传输功能还没有验证，甚至重传等等策略都没有验证，就将整体的双方通信聊天实现了**
@@ -384,3 +383,385 @@ B（接收方）→ A：
 **修复**（`app.js`）：
 - `renderMessages` 中 `scrollTop` 改为 `requestAnimationFrame` 回调，确保 flex 重排完成后再滚动
 - `renderMessages` 文件消息检测加强：`typeof m.msg_id === 'string'` 类型检查
+
+---
+
+### 22. 文件传输中断重传修复（2026-08-12）
+
+**问题**：断开连接后重连，点击"🔄 重新发送"按钮，文件传输表现异常——接收方弹出新的确认对话框（而不是接着之前的进度继续），发送方一直显示"等待对方确认"，接收方显示新的文件消息停留在0%。
+
+**根因**：5 个 bug 连锁导致重传失败：
+
+1. **`resume` 字段未传入 HTTP POST**（`main.py`）：`_handle_file_request_from_browser()` 的 HTTP POST 请求体缺少 `"resume"` 字段，后端无法区分首次请求和续传请求。
+
+2. **`received_chunks` 在 transfer 覆盖时丢失**（`main.py`）：`_relay_from_peer()` 中 `transfers[transfer_id] = {...}` 全量覆盖旧数据，未保留 `received_chunks` 和 `received_bytes`。
+
+3. **`connection_established` 清空消息历史**（`app.js`）：`handleConnectionEstablished()` 无脑 `contacts.set(uuid, {..., messages: []})` 覆盖已有联系人，导致消息列表被擦除。
+
+4. **重复创建文件消息**（`app.js`）：`showFileRequestModal()` 和 `autoAcceptResumeTransfer()` 接受时直接 `push` 新文件消息，未检查是否已有同 `msg_id` 的消息。
+
+5. **重传无连接时静默失败**（`app.js`）：`retryFileTransfer()` 发送 `file_request` 时无连接也不报错，`handleFileRequestResponse` 收到 `accepted: false` 直接删除 transfer 数据。
+
+**修复**：
+
+修复 1（`main.py`）：
+```python
+"resume": msg.get("resume", False),  # 加入 HTTP POST 载荷
+```
+
+修复 2（`main.py`）：
+```python
+old_transfer = transfers.get(transfer_id, {})
+old_received_chunks = old_transfer.get("received_chunks", [])
+old_received_bytes = old_transfer.get("received_bytes", 0)
+transfers[transfer_id] = {
+    ...
+    "received_chunks": old_received_chunks,  # 保留
+    "received_bytes": old_received_bytes,     # 保留
+}
+```
+
+修复 3（`app.js`）：
+```javascript
+if (!contacts.has(msg.uuid)) {
+    contacts.set(msg.uuid, { name: msg.name, ip: msg.ip, status: 'online', messages: [] });
+} else {
+    const c = contacts.get(msg.uuid);
+    c.name = msg.name; c.ip = msg.ip; c.status = 'online';
+    // 保留已有 messages
+}
+```
+
+修复 4（`app.js`）：接受前 `findIndex` 检查同 `msg_id`，存在则复用旧消息更新状态，不存在才 push 新消息。
+
+修复 5（`app.js`）：
+```javascript
+// 重传前先检查连接状态
+const isConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(t.uuid);
+if (!isConnected) {
+    showToast('请先点击"连接"建立聊天连接，再重新发送文件');
+    return;
+}
+```
+
+**UI 增强**：
+- `style.css`：新增 `.btn-retry-file` 样式（白字半透明按钮，hover 加深）
+- `app.js`：`renderFileBubble()` 对 cancelled/failed 状态的文件消息渲染"🔄 重新发送"按钮
+- `sendFile()`：初始化 `aborted: false`；`retryFileTransfer()`：重置 `t.aborted = false`
+
+**效果**：中断→重连→点击重新发送→接收方自动识别 `.progress` 文件直接确认（不弹窗）→发送方从断点继续上传→双方在原文件消息气泡上续推进度条。
+
+---
+
+### 23. 接收方断开时发送方上传未停止修复（2026-08-12）
+
+**问题**：接收方（Bob）主动断开连接时，发送方（Alice）的文件上传仍然继续，未遵守"任何中断都保存进度"的原则。同时接收方断开时也缺少文件传输中的警告提示。
+
+**根因**：4 个 `onclose` 回调（`autoReconnect`、`connectToPeer`、`connectByIp`×2）都没有调用 `abortTransfersForPeer()`。之前只在 `handlePeerDisconnected`（control WS 消息路径）和 `disconnectCurrentChat`（主动方自己断开）中调用了该函数，但接收方断开时触发的是发送方 chat WS 的 `onclose`，这条路径缺失了 abort 调用。
+
+**此外**：`disconnectCurrentChat()` 的文件传输检查只看 `pendingFileTransfers`（仅含**发送中**的上传），接收方自己是接收文件的，`pendingFileTransfers` 中没有对应条目，导致接收方断开时无警告直接断开。
+
+**修复**（`app.js`）：
+
+4 个 `onclose` 回调均新增 `abortTransfersForPeer(uuid)`：
+| 函数 | 变量 | 场景 |
+|------|------|------|
+| `autoReconnect` | `uuid` | 自动重连的 WS 关闭 |
+| `connectToPeer` | `uuid` | 正常连接的 WS 关闭 |
+| `connectByIp` 重赋值 | `realUuid` | 手动 IP 连接收到 `connect_accepted` 后的 close 回调 |
+| `connectByIp` 初始 | `tempUuid` | 手动 IP 连接的初始 close 回调 |
+
+`disconnectCurrentChat()` 增加接收中文件检查：
+```javascript
+// 合并检查发送中和接收中的文件传输
+let hasActiveTransfer = false;
+// 1. 检查发送中（pendingFileTransfers）
+for (const [tid, t] of Object.entries(pendingFileTransfers)) {
+    if (t.uuid === uuid) { hasActiveTransfer = true; break; }
+}
+// 2. 检查接收中（contact.messages 中 status 为 downloading/waiting）
+if (!hasActiveTransfer && contact && contact.messages) {
+    hasActiveTransfer = contact.messages.some(m =>
+        (m.type === 'file' || m.msg_id?.startsWith('f_')) &&
+        m.from !== 'me' &&
+        (m.status === 'downloading' || m.status === 'waiting')
+    );
+}
+if (hasActiveTransfer) {
+    // 弹警告框："有正在传输的文件，断开连接将中断传输"
+}
+```
+
+**效果**：
+- 接收方断开 → 发送方 chat WS onclose → `abortTransfersForPeer(uuid)` → `t.aborted = true` → 上传循环在下个分片停止，进度保留
+- 接收方点击断开时，如果有正在接收的文件（status 为 downloading/waiting），弹出警告确认框
+
+---
+
+### 24. 已在线节点改名/IP 变化不同步修复（2026-08-12）
+
+**问题**：Alice 改名为 Carl 后，Bob 侧的历史联系人和在线列表仍然显示 "Alice"。即使 UDP 心跳每 3 秒广播一次新名字，Bob 的 UI 也不会更新。
+
+**根因**（`discovery.py`）：`_handle_message()` 收到心跳后只在两种情况下触发 `on_peer_online` 回调：
+1. `is_new` — 第一次见到该 UUID
+2. `was_offline` — 该节点之前状态为 offline
+
+**已在线且一直在线**的节点（最常见的情况），即使心跳中的 `name` 或 `ip` 已经变了，回调也不触发。结果：
+- `_notify_peer_online()` 不执行 → `upsert_contact()` 不被调用 → `contacts.json` 不更新
+- 前端从不收到 `peer_online` 消息 → UI 永远显示旧名字/IP
+- 5 秒轮询 `/api/contacts` 也无效，因为后端 `list_contacts()` 读到的 `contacts.json` 就是旧的
+
+**同时**（`app.js`）：`handlePeerOnline()` 原来只更新了 `contacts.status = 'online'`，没有同步 `name` 和 `ip`。即使后端发出了 `peer_online`，name/IP 也不会更新到 contacts Map。
+
+**修复**（`discovery.py`）：
+```python
+# 原来：只在 is_new 或 was_offline 时触发
+# 现在：name 或 ip 变化时也触发
+name_changed = msg.get("name") != prev_data.get("name")
+ip_changed = msg.get("ip") != prev_data.get("ip")
+updated = name_changed or ip_changed
+if self.on_peer_online and (is_new or was_offline or updated):
+    self.on_peer_online(self._peers[uuid].copy())
+```
+
+**修复**（`app.js`）：
+```javascript
+// handlePeerOnline: 原来只更新 status = 'online'
+// 现在也同步 name 和 ip
+if (contacts.has(msg.uuid)) {
+    contacts.get(msg.uuid).status = 'online';
+    if (msg.name) contacts.get(msg.uuid).name = msg.name;
+    if (msg.ip) contacts.get(msg.uuid).ip = msg.ip;
+}
+```
+
+**效果**：已在线节点改名或换 IP 后，下一次心跳（最多 3 秒）对方 UI 即同步更新。
+
+---
+
+### 25. UDP 发现自动写入历史联系人修复（2026-08-12）
+
+**问题**：新启动的节点（从未与任何人建立过聊天连接），仅仅因为 UDP 广播被其他节点收到，就被自动写入对方的 `contacts.json`，出现在"历史联系人"列表中。用户期望历史联系人只保留**真正建立过联系**的人，UDP 发现仅用于更新在线状态。
+
+**根因**（`main.py`）：`_notify_peer_online()` 无条件调用 `upsert_contact()`，而 `upsert_contact` 在 UUID 不存在时会**新建**联系人。任何在局域网广播的节点都会成为"历史联系人"。
+
+```python
+# 原来的代码：全量 upsert → 新建了不该新建的联系人
+upsert_contact(peer["uuid"], peer["name"], peer.get("ip", ""), peer.get("ws_port", 50002))
+```
+
+**修复**（`main.py`）：
+```python
+# 只在历史联系人已存在时才更新 name/ip（不把 UDP 发现的每个人都写入历史联系人）
+if get_contact(peer["uuid"]):
+    upsert_contact(peer["uuid"], peer["name"], peer.get("ip", ""), peer.get("ws_port", 50002))
+```
+
+**效果**：
+- UDP 发现陌生节点 → 只出现在"在线用户"面板，不写入 contacts.json
+- UDP 发现已存联系人 → 更新 name/ip/在线状态
+- 真正建立聊天连接（ws_chat、save_contact）→ 首次写入 contacts.json
+
+---
+
+### 26. 中断后未重传断开仍误报"有文件传输"修复（2026-08-12）
+
+**问题**：文件传输过程中断开连接后重连，再次断开（没有点击重传），断开对话框仍然提示"有正在传输的文件"，但实际上没有任何文件在传输。
+
+**根因**：两处状态未清理：
+1. **发送方**：`abortTransfersForPeer` 设置 `t.aborted = true` 但不删除 `pendingFileTransfers` 条目（为续传保留）。断开检查未过滤 `t.aborted`，误判为活跃传输。
+2. **接收方**：传输中断后接收方的文件消息 status 永远是 `'downloading'`，无任何代码将其改为 `'failed'`。断开检查匹配到 `status === 'downloading'`，误报。
+
+**修复 1**（`app.js` — `abortTransfersForPeer`）：中断时同步标记接收方的文件消息为 `'failed'`：
+```javascript
+const contact = contacts.get(uuid);
+if (contact && contact.messages) {
+    for (const m of contact.messages) {
+        if ((m.type === 'file' || m.msg_id?.startsWith('f_')) &&
+            m.from !== 'me' &&
+            (m.status === 'downloading' || m.status === 'waiting')) {
+            m.status = 'failed';
+            saveFileMessage(uuid, m);
+        }
+    }
+}
+```
+
+**修复 2**（`app.js` — `disconnectCurrentChat`）：发送方检查增加 `!t.aborted` 过滤：
+```javascript
+// 之前：if (t.uuid === uuid) { hasActiveTransfer = true; }
+// 现在：
+if (t.uuid === uuid && !t.aborted) { hasActiveTransfer = true; }
+```
+
+**效果**：中断后 sender 的 `t.aborted = true` 被过滤，receiver 的 status 变为 `'failed'` 不匹配。再次断开不再误报。点击重传后 `t.aborted` 重置为 `false`、status 恢复为 `'downloading'`，检测恢复。
+
+---
+
+### 27. 路径穿越漏洞修复（2026-08-12）
+
+**问题**：`get_download_path()` 直接拼接 `DOWNLOADS_DIR / file_name`，没有 `.resolve()` 和边界检查。攻击者构造 `file_name = "../../../Windows/system32/evil.exe"` 可写文件到任意目录。对比 `download_file` 端点已有 resolve+check 保护，但 `transfer_chunk` 和 `transfer_complete` 两个写路径没加。
+
+**修复**（两层防御）：
+
+第一层 — 入口净化（`main.py` 3 处）：
+```python
+# api_transfer_request、_relay_from_peer、_handle_file_request_from_browser
+file_name = Path(data.get("file_name", "")).name  # 只取文件名，丢弃目录成分
+```
+
+第二层 — 核心防线（`storage.py` `get_download_path`）：
+```python
+safe_name = Path(file_name).name
+target = (DOWNLOADS_DIR / safe_name).resolve()
+allowed_base = DOWNLOADS_DIR.resolve()
+if not str(target).startswith(str(allowed_base)):
+    raise ValueError(f"非法的文件路径: {file_name}")
+```
+同名冲突循环中的 `candidate` 也做了同样的 resolve+check。
+
+---
+
+### 28. 文件传输 HTTP API 补 Token 验证（2026-08-12）
+
+**问题**：`POST /api/transfer/request`、`/api/transfer/chunk`、`/api/transfer/complete` 三个端点无任何认证，内网任何人可调用。`/api/transfer/request` 可刷屏弹窗（每次调用触发 `incoming_file_request` 通知浏览器），`/api/transfer/chunk` 可写垃圾数据撑满磁盘。
+
+**修复**：三个端点均加 token 验证，模式与 `ws_chat` 一致：
+
+```python
+# /api/transfer/request
+if not discovery.verify_token(from_uuid, from_token):
+    if not await _verify_token_via_api(from_uuid, from_token, peer_ip, peer_ws_port):
+        raise HTTPException(403, "token 验证失败")
+
+# /api/transfer/chunk & /api/transfer/complete
+from_uuid = t.get("from_uuid", "")
+if from_uuid and not discovery.verify_token(from_uuid, chunk_token):
+    raise HTTPException(403, "token 验证失败")
+```
+
+调用方同步修改：
+- `_handle_file_request_from_browser`：POST 请求体加 `token: token_manager.get_token()`
+- `app.js` `startChunkUpload`：chunk 上传和 complete 通知加 `token: myInfo.token`
+
+---
+
+### 29. 三个 CRITICAL 竞态/逻辑 Bug 修复（2026-08-12）
+
+**CRITICAL #3 — `contacts.json` 读写竞态**（`storage.py`）：
+
+`upsert_contact` 和 `delete_contact` 在 `load_contacts()` 和 `save_contacts()` 之间释放了锁，两个线程可能读到同一份数据，后写入覆盖先写入。
+
+修复：改用 `with _contacts_lock:` 包裹整个读→改→写周期，与 `append_message` 一致：
+```python
+# upsert_contact
+with _contacts_lock:
+    contacts = _load_contacts_unsafe()
+    # ... modify ...
+    _save_contacts_unsafe(contacts)
+
+# delete_contact 同理
+```
+
+**CRITICAL #4 — 文件传输完成/取消写入错误联系人**（`app.js`）：
+
+`handleTransferComplete` 和 `handleTransferCancelled` 用 `currentChat`（当前显示的聊天窗口）作为联系人 UUID 调 `saveFileMessage`。如果用户正在看 Alice 的聊天但 Bob 的文件传输完成了，Bob 的文件消息被写进 Alice 的数据。
+
+修复：`findFileMsgByTransferId` 返回值从裸 `message` 改为 `{msg, peerUuid}`，7 个调用方全部更新为用 `peerUuid` 精准定位：
+```javascript
+// 之前
+const fileMsg = findFileMsgByTransferId(transferId);
+saveFileMessage(currentChat, fileMsg);  // BUG: currentChat 可能不是 fileMsg 所属联系人
+
+// 之后
+const result = findFileMsgByTransferId(transferId);
+if (result) {
+    const { msg: fileMsg, peerUuid } = result;
+    saveFileMessage(peerUuid, fileMsg);  // 正确：用文件消息实际所属联系人
+}
+```
+
+**CRITICAL #5 — 接受连接后联系人未落盘**（`app.js`）：
+
+`respondConnection` 只在内存 `contacts` Map 里存了联系人，没有发 `save_contact` 给后端。刷新页面后联系人消失。
+
+修复：接受连接后追加 `save_contact` control WS 消息：
+```javascript
+controlWs.send(JSON.stringify({
+    type: 'save_contact',
+    uuid: uuid, name: peer.name, ip: peer.ip,
+    ws_port: peer.ws_port || 50002,
+}));
+```
+
+---
+
+### 30. WS 连接超时机制（2026-08-12）
+
+**问题**：`ws_chat` 有两个协程永久阻塞点：
+1. `await confirmed_event.wait()` — 等用户确认，用户不操作则协程永不释放，`pending_connections` 泄漏
+2. `await ws.receive_json()` — 已建立连接后双方静默，连接永不关闭
+
+**修复**：
+
+连接请求超时（1 分钟）：
+```python
+try:
+    await asyncio.wait_for(confirmed_event.wait(), timeout=60)
+except asyncio.TimeoutError:
+    # 清理 pending_connections → 通知浏览器 connection_timeout
+    # → 给发起方发 connect_rejected(reason="timeout") → 关闭 WS
+```
+
+空闲连接超时（10 分钟）：
+```python
+while True:
+    try:
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=600)
+    except asyncio.TimeoutError:
+        # 检查是否有活跃文件传输（transfers 中 status=="receiving"）
+        # 有则 continue 跳过，无则通知浏览器 connection_idle_close → 关闭
+```
+
+前端新增 `handleConnectionTimeout`（清理待处理请求）和 `handleConnectionIdleClose`（清理连接状态 + 显示"连接因长时间无活动已自动关闭"）。finally 块用 `idle_closed` 标志位避免重复发 `peer_disconnected` 通知。
+
+---
+
+### 31. readAsBase64 永不 reject 修复（2026-08-12）
+
+**问题**：`readAsBase64(blob)` 返回 `new Promise((resolve) => {...})`，只注册了 `onloadend`，没有 `onerror`。`FileReader` 读盘失败时 Promise 永不 settle，`startChunkUpload` 在 `await readAsBase64(blob)` 处永久挂起。
+
+**修复**：
+```javascript
+// Promise 加 reject 参数
+return new Promise((resolve, reject) => {
+    reader.onloadend = () => { ... resolve(b64); };
+    reader.onerror = () => { reject(new Error('文件读取失败')); };
+});
+
+// 调用方加 try/catch
+try {
+    dataB64 = await readAsBase64(blob);
+} catch (e) {
+    t.failed = true;
+    fileMsg.status = 'failed';
+    return;  // 干净退出
+}
+```
+
+---
+
+### 32. 未连接时发送消息/文件的 UX 改进（2026-08-12）
+
+**问题**：之前输入框和按钮在未连接时直接 `disabled`，用户看到灰色控件不知道为什么不能发。离线时连提示栏都没有。
+
+**修复**：输入框和按钮始终可用，在 `sendCurrentMessage`、`onFileSelected`、`sendFile`、`retryFileTransfer` 四个入口处做连接检查，未通过则弹居中提示：
+
+| 状态 | 提示文案 |
+|------|---------|
+| 离线 | "对方当前不在线，等待对方上线后才能聊天嗷~" |
+| 在线未连接 | "连接按钮都懒得点，那就别想和我聊天~" |
+| 离线（重传） | "对方当前不在线，等待对方上线后才能重传嗷~" |
+| 在线未连接（重传） | "连接按钮都懒得点，那就别想重传文件~" |
+
+新增 `showCenterToast()` 函数：白底黑字 + 阴影，屏幕正中央弹出（`scale 0.88→1`）后渐隐，1.75s 自动消失。CSS 动画 `centerToastPop`。

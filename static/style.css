@@ -195,6 +195,19 @@ body {
 .item .sub { font-size: 11px; color: var(--text-secondary); }
 .item .actions { display: flex; gap: 4px; flex-shrink: 0; }
 
+.item .btn-connect {
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid var(--primary);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--primary);
+  cursor: pointer;
+  flex-shrink: 0;
+  font-family: inherit;
+}
+.item .btn-connect:hover { background: var(--primary); color: #fff; }
+
 .item .btn-accept, .item .btn-reject {
   font-size: 10px;
   padding: 2px 6px;
@@ -262,6 +275,24 @@ body {
     background: #fef2f2;
     color: #fff;
     background: var(--danger);
+}
+
+/* 聊天区连接提示条 */
+#chat-connect-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: #fef9e7;
+  border-bottom: 1px solid #f0d87e;
+  font-size: 13px;
+  color: #8a6d14;
+  flex-shrink: 0;
+}
+#chat-connect-bar .btn-primary {
+  font-size: 12px;
+  padding: 4px 14px;
 }
 
 #chat-messages {
@@ -356,7 +387,7 @@ body {
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ===== 弹窗 ===== */
-#modal-overlay, #file-modal-overlay {
+#modal-overlay, #file-modal-overlay, #confirm-modal-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0,0,0,0.4);
@@ -384,6 +415,18 @@ body {
   font-family: inherit;
 }
 .modal input:focus { border-color: var(--primary); }
+
+#modal-name-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin-top: 4px;
+  min-height: 18px;
+  opacity: 0;
+  transition: opacity 0.5s;
+}
+#modal-name-error.show {
+  opacity: 1;
+}
 .modal-buttons {
   display: flex;
   gap: 8px;
@@ -391,15 +434,37 @@ body {
   margin-top: 16px;
 }
 .modal-buttons button {
-  padding: 6px 16px;
+  padding: 8px 20px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface);
   cursor: pointer;
   font-size: 13px;
+  color: var(--text);
   font-family: inherit;
+  transition: all 0.15s;
 }
-.modal-buttons button:hover { background: var(--bg); }
+.modal-buttons button:hover {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.modal-buttons .btn-danger {
+  /* 初始与取消外观一致 */
+}
+.modal-buttons .btn-danger:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+/* 确认弹窗正文 */
+#confirm-modal-body {
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.6;
+  margin-bottom: 4px;
+}
 
 /* 文件消息气泡 */
 .file-msg {
@@ -491,6 +556,22 @@ body {
 .file-msg.received .btn-open-file:hover {
   background: #e8edf9;
 }
+.btn-retry-file {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  border: 1px solid rgba(255,255,255,0.5);
+  border-radius: 4px;
+  background: rgba(255,255,255,0.15);
+  color: #fff;
+  cursor: pointer;
+  font-family: inherit;
+  margin-left: 6px;
+}
+.btn-retry-file:hover {
+  background: rgba(255,255,255,0.35);
+}
 .msg .time {
   font-size: 10px;
   opacity: 0.7;
@@ -528,6 +609,14 @@ body {
   0% { opacity: 1; }
   70% { opacity: 1; }
   100% { opacity: 0; }
+}
+
+/* 居中提示：弹出后渐隐 */
+@keyframes centerToastPop {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.88); }
+  12%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  60%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1); }
 }
 
 /* 响应式 */
