@@ -307,6 +307,18 @@ class Discovery:
             except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
 
+    def _is_same_subnet(self, ip: str) -> bool:
+        """判断 IP 是否与本机任一网卡同子网（用于多网卡广播去重）"""
+        if not ip or ip == "127.0.0.1":
+            return False
+        for _, iface_ip in _get_broadcast_interfaces():
+            if iface_ip == "0.0.0.0":
+                continue
+            # 按 /24 子网比较前 3 段
+            if iface_ip.rsplit(".", 1)[0] == ip.rsplit(".", 1)[0]:
+                return True
+        return False
+
     def _handle_message(self, msg: dict):
         """处理收到的广播消息"""
         uuid = msg.get("uuid", "")
@@ -323,10 +335,23 @@ class Discovery:
                 )
 
                 prev_data = self._peers.get(uuid, {})
+                new_ip = msg.get("ip", "")
+                prev_ip = prev_data.get("ip", "")
+
+                # 多网卡广播去重：只接受同子网的 IP，防止虚拟机/VPN 网卡的
+                # 广播覆盖了真正的局域网 IP（最后到达的包会覆盖先前的）
+                use_ip = new_ip
+                if not is_new and new_ip and prev_ip:
+                    new_same = self._is_same_subnet(new_ip)
+                    prev_same = self._is_same_subnet(prev_ip)
+                    if prev_same and not new_same:
+                        # 旧 IP 和本机同子网，新 IP 不是 → 保留旧 IP
+                        use_ip = prev_ip
+
                 self._peers[uuid] = {
                     "uuid": uuid,
                     "name": msg.get("name", "Unknown"),
-                    "ip": msg.get("ip", ""),
+                    "ip": use_ip,
                     "ws_port": msg.get("ws_port", 50002),
                     "token": msg.get("token", ""),
                     "previous_token": prev_data.get("token", ""),
