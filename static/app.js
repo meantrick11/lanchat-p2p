@@ -301,16 +301,15 @@ function handlePeerOffline(msg) {
     if (contacts.has(msg.uuid)) {
         contacts.get(msg.uuid).status = 'offline';
     }
-    // 对应聊天 WS 断开
-    const ws = activeChats.get(msg.uuid);
-    if (ws) {
-        ws.close();
-        activeChats.delete(msg.uuid);
-    }
+    // UDP 心跳丢失不代表 TCP chat WS 已断，不在此处关闭连接。
+    // 连接是否存活由 ws.onclose / 后端 peer_disconnected 决定。
+    const stillConnected = activeChats.has(msg.uuid) || connectedPeers.has(msg.uuid);
     renderOnlineList();
     renderContactsList();
     updateChatHeaderStatus();
-    addSystemMessage(msg.uuid, `${msg.name} 已下线`);
+    if (!stillConnected) {
+        addSystemMessage(msg.uuid, `${msg.name} 已下线`);
+    }
 }
 
 function handleIncomingConnection(msg) {

@@ -279,10 +279,11 @@ async def _verify_token_via_api(uuid: str, token: str, ip: str, port: int) -> bo
 
 async def _probe_saved_contacts():
     """
-    定期对历史联系人中未被 UDP 广播发现的进行 HTTP 探活。
-    跨子网的联系人 UDP 广播发现不了，但 TCP 可达，通过此方式：
-      1. 启动后自动发现跨子网上线
-      2. 持续更新 last_seen 防止被 UDP 超时检查踢下线
+    定期对历史联系人进行 HTTP 探活（每 30 秒）。
+
+    跨子网时 UDP 广播不可达，但 TCP/HTTP 可达；同子网若 UDP 丢包导致
+    last_seen 过期，探活也可续期。对所有已保存联系人探活（含已在 peer_list
+    中的节点），成功则刷新 last_seen / token，避免被 discovery 误判离线。
     """
     import json as _json
     import urllib.request as _urllib
@@ -300,9 +301,6 @@ async def _probe_saved_contacts():
                     continue
                 ip = c.get("ip", "")
                 if not ip or ip == "127.0.0.1":
-                    continue
-                # 已被 UDP 广播发现的跳过（同子网，UDP 会自动续 last_seen）
-                if any(p["uuid"] == c["uuid"] for p in discovery.get_peers()):
                     continue
 
                 try:
@@ -385,6 +383,11 @@ async def _notify_peer_online(peer: dict):
 
 async def _notify_peer_offline(peer: dict):
     """discovery 回调：节点离线 → 通知浏览器"""
+    peer_uuid = peer.get("uuid", "")
+    # 对方正通过 chat WS 连着本机时，UDP 超时不应推 offline（跨子网/丢包误报）
+    with _chats_lock:
+        if peer_uuid and peer_uuid in active_chats:
+            return
     if control_ws:
         try:
             await control_ws.send_json({
