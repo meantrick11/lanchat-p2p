@@ -765,3 +765,31 @@ try {
 | 在线未连接（重传） | "连接按钮都懒得点，那就别想重传文件~" |
 
 新增 `showCenterToast()` 函数：白底黑字 + 阴影，屏幕正中央弹出（`scale 0.88→1`）后渐隐，1.75s 自动消失。CSS 动画 `centerToastPop`。
+
+### 33. 单方面删除后重连自动接受修复（2026-08-13）
+
+**问题**：A 单方面删除 B 后，无论 A 还是 B 再发起连接，都会被直接自动接受、不弹"连接请求"验证。不符合"单方面删除后再次连接必须请求对方验证"的要求。
+
+**根因分析**：
+- 连接信任原先只看接收方的 `trusted` 字段（`existing_contact and trusted`），是**非对称**的。
+- A 删除 B 时若**不在连接状态**，`delete_contact` 的 `contact_untrusted` 通知发不出去，B 永远不知道被删，B 的 `trusted[A]` 仍是 True。
+- 下次 A 连 B，B 一看"有记录 + trusted=True"→ 直接自动接受。
+- 此前 v32 的"墓碑 + deleted_you"方案失效：墓碑与"删除时对方是否在线"耦合，`deleted_you` 又依赖发起方自己的墓碑记录，链路太绕。
+
+**修复**：把信任判定从"接收方单边 trusted"改为"双方历史共同决定"（对称 AND）。
+
+- `storage.py`
+  - `delete_contact` 改回完整删除（`del contacts[uuid]`），不再留墓碑
+  - 移除 `get_deleted_uuids`；`list_contacts` 移除墓碑过滤
+  - 新增 `remove_deleted_tombstones()`：启动时一次性清理 v32 遗留的 `deleted=true` 记录（否则这些墓碑会让 `get_contact` 仍返回真值，判定再次失效）
+- `main.py`
+  - `ws_chat`：`connect_request` 字段 `deleted_you` → `have_you`；判定改为 `if existing_contact and peer_has_me`（existing_contact=我有没有他，have_you=他有没有我）
+  - `/api/me` 移除 `deleted_uuids`
+  - 启动时调用 `remove_deleted_tombstones()`
+- `app.js`
+  - `connectToPeer`：在 `openChat` **之前**取 `const haveYou = contacts.has(uuid)`（openChat 会把刚删的联系人从后端 `/api/messages` 重新加回 Map，之后取会误判为 True）
+  - `autoReconnect`：`have_you: contacts.has(uuid)`
+  - `connectByIp`：不知道对方真实 uuid，按 IP 在历史里查找 `[...contacts.values()].some(c => c.ip === ip)`
+- `index.html`：缓存版本 v32 → v33
+
+**验证方法**：单机双实例（`LANCHAT_PORT`=50002/50003 + 各自独立 `LANCHAT_DATA_DIR`）跑起来，首次连接需验证 → 断开 → A 删 B → A 再连 B，应再次弹验证而非直接连上。

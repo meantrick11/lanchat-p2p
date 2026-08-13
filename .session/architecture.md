@@ -4,7 +4,7 @@
 
 实现局域网内 P2P 通讯工具：**发现好友 → 文字聊天 → 文件传输**。
 
-- **加分项**：文件分片上传、断点续传、通讯加密
+- **加分项**：文件分片上传、断点续传
 - **技术栈**：Python 3 + FastAPI + 原生 HTML/CSS/JS
 - **表现形式**：WebUI（浏览器打开即用）
 
@@ -50,36 +50,36 @@ internproject/
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  🔗 LanChat                    我: 小明                   │
-│                                IP: 192.168.1.100          │
-│                                网段: 192.168.1.0/24        │
+│  🔗 LanChat                    我: 小明                  │
+│                                IP: 192.168.1.100         │
+│                                网段: 192.168.1.0/24      │
 ├──────────────┬───────────────────────────────────────────┤
 │  在线用户 3   │                                           │
 │  [🔍扫描]    │                                           │
-│ ┌──────────┐ │         与 小红 的聊天内容                 │
-│ │🟢 小红    │ │                                           │
-│ │🟢 小刚    │ │   小明: 你好！                              │
-│ │🟢 小李    │ │   小红: 你好呀~                             │
-│ │    ↕滚动  │ │                                           │
+│ ┌──────────┐ │         与 小红 的聊天内容                  │
+│ │🟢 小红   │ │                                           │
+│ │🟢 小刚   │ │   小明: 你好！                             │
+│ │🟢 小李   │ │   小红: 你好呀~                            │
+│ │          │ │                                           │
 │ └──────────┘ │                                           │
 │──────────────│                                           │
 │  连接请求 2   │ ← 有待处理请求时才出现，橙色 🟠 标识        │
 │ ┌──────────┐ │                                           │
-│ │🟠 张三    │ │                                           │
+│ │🟠 张三   │ │                                           │
 │ │ [同意][拒]│ │                                           │
-│ │🟠 李四    │ │                                           │
-│ │    ↕滚动  │ │                                           │
+│ │🟠 李四   │ │                                           │
+│ │          │ │                                           │
 │ └──────────┘ │                                           │
 │──────────────│                                           │
 │  历史联系人 5 │                                           │
 │ ┌──────────┐ │                                           │
-│ │🟢 小红    │ │                                           │
-│ │🔴 老张    │ │                                           │
-│ │🔴 赵六    │ │                                           │
-│ │    ↕滚动  │ │                                           │
+│ │🟢 小红   │ │                                           │
+│ │🔴 老张   │ │                                           │
+│ │🔴 赵六   │ │                                           │
+│ │          │ │                                           │
 │ └──────────┘ │                                           │
 ├──────────────┴───────────────────────────────────────────┤
-│  💬 输入消息...                    [📎发文件]    [发送]    │
+│  💬 输入消息...                    [📎发文件]    [发送]   │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -119,16 +119,20 @@ internproject/
 | 端点 | 方法 | 作用 |
 |------|------|------|
 | `/` | GET | 返回前端页面 |
-| `/api/me` | GET | 当前用户信息（uuid、昵称、IP、网段） |
+| `/api/me` | GET | 本机信息（uuid、昵称、IP、网段、ws_port、token、deleted_uuids） |
 | `/api/peers` | GET | 当前在线用户列表 |
 | `/api/contacts` | GET | 历史联系人列表（合并在线状态） |
+| `/api/messages/{uuid}` | GET | 指定联系人的聊天记录 |
 | `/api/config` | POST | 修改昵称 |
+| `/api/contacts/{uuid}` | DELETE | 删除联系人（墓碑机制） |
+| `/api/pending` | GET | 待处理的连接请求列表 |
 | `/ws/control` | WS | **自己浏览器 ↔ 自己后端** 的控制通道 |
 | `/ws/chat` | WS | **其他用户浏览器 ↔ 自己后端** 的聊天通道 |
-| `/api/transfer/request` | POST | 文件传输请求（接收方） |
+| `/api/transfer/request` | POST | 文件传输请求（后端间 relay，回退路径） |
 | `/api/transfer/chunk` | POST | 接收文件分片 |
 | `/api/transfer/complete` | POST | 文件传输完成确认 |
 | `/api/transfer/status/{id}` | GET | 查询传输进度（断点续传用） |
+| `/api/downloads/{file_name}` | GET | 下载/打开已接收文件（带路径穿越防护） |
 
 ---
 
@@ -220,18 +224,32 @@ B的UI弹窗: "小明 请求与你建立连接"
        双方可以开始聊天
 ```
 
+> 注：以上为「新联系人」首次连接流程（需用户确认）。若 B 的历史联系人中已有 A 且
+> `trusted=true`、A 未带 `deleted_you`，则跳过确认直接 `connect_accepted`（自动重连）；
+> 不可信/墓碑联系人则强制回到确认流程（详见 9.9）。
+
 ### 7.5 消息收发路径
 
 ```
-A 发消息给 B:
-  A浏览器 ──WS(直连)──→ B的FastAPI ──WS(/ws/control)──→ B浏览器
+一条连接只有一条 chat WS，由主动发起方建立（A浏览器 ↔ B后端）：
 
-B 发消息给 A:
-  B浏览器 ──WS(直连)──→ A的FastAPI ──WS(/ws/control)──→ A浏览器
+A 发消息给 B（主动方直连）:
+  A浏览器 ──chat WS──→ B后端 ──control WS──→ B浏览器
 
-每方浏览器持有两种WS:
-  ① 连自己后端: ws://localhost:50002/ws/control   （接收通知/消息）
-  ② 连对方后端: ws://对方IP:50002/ws/chat         （发送消息）
+B 发消息给 A（被动方经自己后端，复用同一条 chat WS 回传）:
+  B浏览器 ──control WS──→ B后端 ──chat WS(复用A建立的)──→ A浏览器
+
+浏览器持有的 WS 因角色而异：
+  · 主动发起方：① 连自己后端 /ws/control（收通知）② 连对方后端 /ws/chat（发消息）
+  · 被动接收方：仅 ① 连自己后端 /ws/control；发消息时由自己后端复用对方建立的 chat WS 回传
+
+前端发送时按「是否有出站 chat WS」分流：
+  · 有 chat WS（主动方）→ 直接经 chat WS 发送
+  · 无 chat WS（被动方）→ 经 control WS 发 chat_message，自己后端转发
+
+消息持久化「双保险」：
+  后端 _relay_from_peer 收到消息先落盘；前端收到后再补发 save_message
+  （覆盖直连绕过本后端的情况），由 storage.append_message 按 msg_id 去重，重复调用安全。
 
 连接成功后，A自动加入B的历史联系人，B也自动加入A的历史联系人。
 ```
@@ -376,29 +394,70 @@ A 重启 → 浏览器端传输队列丢失 → 无法自动续传
 # ===== UDP 心跳 =====
 {"type":"hello", "uuid":"a1b2c3...", "name":"小明", "ip":"192.168.1.100",
  "ws_port":50002, "token":"abc123...", "timestamp":1691670000.0}
+{"type":"goodbye", "uuid":"a1b2c3..."}   # 正常退出时广播，立即标记离线
 
-# ===== WebSocket 连接建立 =====
-请求:  {"type":"connect_request", "uuid":"...", "name":"...", "token":"...", "ip":"...", "ws_port":50002}
+# ===== WebSocket 连接建立（chat WS）=====
+请求:  {"type":"connect_request", "uuid":"...", "name":"...", "token":"...",
+       "ip":"...", "ws_port":50002, "deleted_you":false}
 同意:  {"type":"connect_accepted", "uuid":"...", "name":"...", "ip":"...", "ws_port":50002}
-拒绝:  {"type":"connect_rejected", "reason":"user_declined"}
+拒绝:  {"type":"connect_rejected", "reason":"invalid_token|self_connect|timeout"}
 
-# ===== WebSocket 聊天 =====
-发送:  {"type":"chat", "msg_id":"m001", "from":"...", "content":"你好", "timestamp":"..."}
+# ===== WebSocket 聊天（chat WS，双向）=====
+发送:  {"type":"chat", "msg_id":"m001", "content":"你好"}
+转发:  {"type":"chat", "msg_id":"m001", "from":"...", "from_name":"...",
+       "content":"...", "timestamp":"..."}
 确认:  {"type":"ack", "msg_id":"m001"}
 
-# ===== WebSocket 文件信令 =====
-请求:  {"type":"file_request", "file_name":"...", "file_size":..., 
-        "chunk_size":65536, "total_chunks":..., "transfer_id":"..."}
-响应:  {"type":"file_response", "transfer_id":"...", "accepted":true/false}
+# ===== WebSocket 文件信令（chat WS，双向）=====
+请求:  {"type":"file_request", "file_name":"...", "file_size":...,
+       "chunk_size":65536, "total_chunks":..., "transfer_id":"...", "resume":false}
+响应:  {"type":"file_response", "transfer_id":"...", "accepted":true}
+取消:  {"type":"file_cancel", "transfer_id":"..."}
 
-# ===== Control WS 特有(server→browser) =====
-新连接请求: {"type":"incoming_connection", "from_uuid":"...", "from_name":"..."}
-用户响应:   {"type":"connection_response", "to_uuid":"...", "accepted":true/false}
-通知已连接: {"type":"peer_connected", "uuid":"...", "name":"...", "ip":"..."}
-通知断开:   {"type":"peer_disconnected", "uuid":"..."}
-转发消息:   {"type":"chat_message", "from":"...", "from_name":"...", "content":"..."}
-文件请求:   {"type":"incoming_file_request", "from":"...", "file_name":"...", ...}
-传输完成:   {"type":"transfer_complete", "transfer_id":"...", "verified":true}
+# ===== Control WS：浏览器 → 后端 =====
+改昵称:     {"type":"update_name", "name":"..."}
+连接响应:   {"type":"connection_response", "to_uuid":"...", "accepted":true}
+文件响应:   {"type":"file_response", "transfer_id":"...", "accepted":true}
+取消传输:   {"type":"file_cancel", "transfer_id":"..."}
+主动断开:   {"type":"disconnect", "to_uuid":"..."}
+注册传输:   {"type":"register_transfer", "transfer_id":"...", "file_name":"...", ...}
+中转聊天:   {"type":"chat_message", "to_uuid":"...", "msg_id":"...", "content":"..."}
+文件请求回退: {"type":"file_request", "to_uuid":"...", "transfer_id":"...", ...}
+保存消息:   {"type":"save_message", "peer_uuid":"...", "sender":"me|uuid",
+            "content":"...", "msg_id":"...", "msg_type":"chat|file", ...}
+保存联系人: {"type":"save_contact", "uuid":"...", "name":"...", "ip":"...", "ws_port":50002}
+标记不可信: {"type":"mark_untrusted", "uuid":"..."}
+删除联系人: {"type":"delete_contact", "uuid":"..."}
+
+# ===== Control WS：后端 → 浏览器 =====
+初始化:     {"type":"init", "uuid":"...", "name":"...", "ip":"...", "network":"...",
+            "ws_port":50002, "token":"...", "contacts":[...], "online_peers":[...],
+            "active_peers":[...]}
+节点上线:   {"type":"peer_online", "uuid":"...", "name":"...", "ip":"...",
+            "ws_port":50002, "token":"..."}
+节点下线:   {"type":"peer_offline", "uuid":"...", "name":"..."}
+新连接请求: {"type":"incoming_connection", "uuid":"...", "name":"...", "ip":"...", "ws_port":50002}
+待处理数量: {"type":"pending_update", "count":2}
+连接已建立: {"type":"connection_established", "uuid":"...", "name":"...", "ip":"..."}
+连接断开:   {"type":"peer_disconnected", "uuid":"...", "name":"..."}
+主动断开确认: {"type":"disconnected", "uuid":"..."}
+联系人已删: {"type":"contact_deleted", "uuid":"..."}
+被标记不可信: {"type":"contact_untrusted", "uuid":"..."}
+连接超时:   {"type":"connection_timeout", "uuid":"...", "name":"..."}
+空闲关闭:   {"type":"connection_idle_close", "uuid":"...", "name":"..."}
+收到聊天:   {"type":"chat_message", "from":"...", "from_name":"...", "msg_id":"...",
+            "content":"...", "timestamp":"..."}
+消息确认:   {"type":"message_ack", "msg_id":"..."}
+发送失败:   {"type":"send_failed", "msg_id":"...", "reason":"not_connected|send_error"}
+文件请求:   {"type":"incoming_file_request", "transfer_id":"...", "file_name":"...",
+            "file_size":..., "from_uuid":"...", "from_name":"...", "resume":false}
+文件响应:   {"type":"file_request_response", "transfer_id":"...", "accepted":true}
+转发文件响应: {"type":"forward_file_response", "transfer_id":"...", "accepted":true, "to_uuid":"..."}
+传输进度:   {"type":"transfer_progress", "transfer_id":"...", "file_name":"...",
+            "received_bytes":..., "total_bytes":...}
+传输完成:   {"type":"transfer_complete", "transfer_id":"...", "file_name":"...", "verified":true}
+传输取消:   {"type":"transfer_cancelled", "transfer_id":"..."}
+传输恢复:   {"type":"transfer_resumed", "transfer_id":"...", "file_name":"...", "from_name":"..."}
 
 # ===== HTTP 文件分片 =====
 POST /api/transfer/chunk
@@ -410,7 +469,8 @@ POST /api/transfer/complete
   Return: {"status":"ok", "verified":true}
 
 GET /api/transfer/status/{transfer_id}
-  Return: {"transfer_id":"...", "received_bytes":..., "status":"in_progress"}
+  Return: {"transfer_id":"...", "file_name":"...", "received_bytes":...,
+           "received_chunks_count":..., "total_chunks":..., "status":"in_progress"}
 ```
 
 ---
@@ -434,17 +494,25 @@ GET /api/transfer/status/{transfer_id}
   "uuid_aaa": {
     "name": "小红",
     "ip": "192.168.1.101",
+    "ws_port": 50002,
     "first_contact": "2026-08-10T14:00:00",
     "last_contact": "2026-08-10T15:30:00",
+    "trusted": true,
+    "deleted": false,
     "messages": [
-      {"from":"me", "content":"你好", "msg_id":"m001", "timestamp":"..."},
-      {"from":"uuid_aaa", "content":"你好呀~", "msg_id":"m002", "timestamp":"..."}
+      {"from":"me", "content":"你好", "msg_id":"m001", "type":"chat", "timestamp":"..."},
+      {"from":"uuid_aaa", "content":"你好呀~", "msg_id":"m002", "type":"chat", "timestamp":"..."},
+      {"from":"uuid_aaa", "content":"", "msg_id":"f_t_xxx", "type":"file",
+       "file_name":"demo.mp4", "file_size":104857600, "transfer_id":"t_xxx",
+       "status":"complete", "progress":100, "timestamp":"..."}
     ]
   }
 }
 ```
 
 - `from: "me"` = 自己发的，`from: "uuid_xxx"` = 对方发的
+- `type: "chat"|"file"` 区分文本与文件消息；文件消息携带 file_name/file_size/transfer_id/status/progress
+- 每条联系人记录含 `ws_port`（跨子网 HTTP 探活用）、`trusted`、`deleted`（墓碑）字段
 - 下次打开页面，加载历史消息显示在聊天区
 
 ### 9.3 同名文件自动改名
@@ -531,6 +599,29 @@ A（发起方，跨子网）→ B：
 - 后端 `ws_chat`：拒绝 `peer_uuid == MY_UUID` 的 self_connect
 - 前端 `handlePeerOnline` / `updateOnlinePeers` / `updateContacts`：跳过 `myInfo.uuid`
 - 前端 `connectByIp`：拒绝自己的 IP:端口
+
+### 9.9 删除联系人与墓碑机制
+
+删除联系人不是物理删除，而是保留「墓碑」记录，用于重连时判断双方身份关系：
+
+- 本端删除：`delete_contact` 将联系人 `trusted=false` + `deleted=true` + 清空 messages
+  （墓碑不显示在前端，`list_contacts` 过滤 `deleted=true`）
+- 同时通过 chat WS 通知对端 `contact_untrusted`（对端把本端标记为 `trusted=false`，不删数据）
+- 墓碑的作用：下次重连时，发起方在 connect_request 里带 `deleted_you`（来自 `/api/me` 的
+  `deleted_uuids`），对方据此强制重新走用户确认流程，而非自动接受
+
+```
+A 删除 B:
+  ① A 前端发 delete_contact → A 后端
+  ② A 后端通知 B 后端 contact_untrusted（B 标记 A 为 trusted=false）
+  ③ A 后端关闭与 B 的 chat WS、清理待确认请求和进行中的传输
+  ④ A 后端 delete_contact：B 变墓碑（deleted=true, trusted=false），清空聊天记录
+
+A 再次连接 B:
+  A 在 connect_request 带 deleted_you:true（A 的 deleted_uuids 含 B）
+  B 收到后即使本端 trusted=true 也强制走用户确认，而非自动接受
+  同意后 upsert_contact 清除墓碑（deleted=false）并恢复 trusted=true
+```
 
 ### 9.6 其他细节
 

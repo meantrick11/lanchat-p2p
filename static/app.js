@@ -934,7 +934,6 @@ async function autoReconnect(uuid) {
         const resp = await fetch('/api/me');
         const me = await resp.json();
         myInfo.token = me.token;
-        myInfo.deleted_uuids = me.deleted_uuids || [];
     } catch (e) { /* 刷新失败则用现有 token */ }
 
     try {
@@ -949,7 +948,7 @@ async function autoReconnect(uuid) {
                 token: myInfo.token,
                 ip: myInfo.ip,
                 ws_port: myInfo.ws_port,
-                deleted_you: (myInfo.deleted_uuids || []).includes(uuid),
+                have_you: contacts.has(uuid),
             }));
         };
 
@@ -1013,15 +1012,17 @@ async function connectToPeer(uuid, name, ip) {
         return;
     }
 
+    // 打开聊天窗口之前记录：自己历史里是否还保留着对方（openChat 可能把刚删除的
+    // 联系人重新加回 Map，导致误判），用于告诉对方是否需要重新验证
+    const haveYou = contacts.has(uuid);
+
     openChat(uuid); // 先打开聊天窗口，显示"连接中..."
 
     // 连接前先刷新自己的 token（token 每3秒更新，避免用过期的）
-    // 同时刷新 deleted_uuids（判断是否删除过对方，重连时需强制对方验证）
     try {
         const resp = await fetch('/api/me');
         const me = await resp.json();
         myInfo.token = me.token;
-        myInfo.deleted_uuids = me.deleted_uuids || [];
     } catch (e) { /* 刷新失败则用现有 token */ }
 
     try {
@@ -1050,7 +1051,7 @@ async function connectToPeer(uuid, name, ip) {
                 token: myInfo.token,
                 ip: myInfo.ip,
                 ws_port: myInfo.ws_port,
-                deleted_you: (myInfo.deleted_uuids || []).includes(uuid),
+                have_you: haveYou,
             }));
         };
 
@@ -1151,7 +1152,6 @@ async function connectByIp(ip, port) {
         const resp = await fetch('/api/me');
         const me = await resp.json();
         myInfo.token = me.token;
-        myInfo.deleted_uuids = me.deleted_uuids || [];
     } catch (e) { /* ignore */ }
 
     try {
@@ -1166,6 +1166,8 @@ async function connectByIp(ip, port) {
                 token: myInfo.token,
                 ip: myInfo.ip,
                 ws_port: myInfo.ws_port,
+                // 手动连接不知道对方真实 uuid，按 IP 在历史里查找是否有该联系人
+                have_you: [...contacts.values()].some(c => c.ip === ip),
             }));
         };
 

@@ -433,3 +433,27 @@ if get_contact(peer["uuid"]):
 - 离线 → "对方当前不在线，等待对方上线后才能聊天嗷~"
 - 在线未连接 → "连接按钮都懒得点，那就别想和我聊天~"
 - 重传分支使用同风格但区分场景的文案
+
+---
+
+## 40. 单方面删除联系人后重连，如何判断是否需要重新验证？
+
+**决定**：信任判定由**双方历史共同决定**，不再由接收方单边 `trusted` 字段决定。发起方在 `connect_request` 中携带 `have_you`（自己历史里是否还保留着对方），接收方拿它和自己的 `existing_contact`（自己历史里是否还保留着发起方）做 AND 运算：两者都为 True → 自动接受；任一为 False（有一方删除过对方）→ 走用户确认流程。
+
+**真值表**：
+
+| 场景 | 发起方 have_you | 接收方 existing_contact | 结果 |
+|------|------|------|------|
+| 双方都没删（正常重连） | T | T | 自动接受 |
+| A 删了 B（连接中/未连接一样） | F | T | 验证 |
+| B 删了 A | T | F | 验证 |
+| 双方都删了 / 首次连接 | F | F | 验证 |
+
+**"第一次连接"如何判断**：第一次连接 = 双方历史里都不存在对方，AND 自然为 False → 走验证，无需任何额外标记。
+
+**原因**：原 `trusted` 字段非对称——只反映"接收方还信不信发起方"，且 A 删除 B 时若不在连接状态，B 永远收不到 `contact_untrusted`，B 的 `trusted[A]` 仍是 True，下次连接被自动接受，违背"单方面删除后再次连接必须验证"的要求。此前 v32 用"墓碑 + deleted_you"补这个洞，因墓碑与"删除时是否连接"耦合而失效，已回退。
+
+**实现**：
+- `storage.py`：`delete_contact` 改回完整删除（`del`）；移除 `get_deleted_uuids`；新增 `remove_deleted_tombstones()` 启动时清理 v32 遗留墓碑
+- `main.py`：`ws_chat` 判定改为 `if existing_contact and peer_has_me`；`/api/me` 移除 `deleted_uuids`
+- `app.js`：`connectToPeer`/`autoReconnect`/`connectByIp` 发送 `have_you`；`connectToPeer` 在 `openChat` **之前**取 `contacts.has(uuid)`（openChat 会把刚删的联系人从后端重新加回 Map，之后取会误判为 True）

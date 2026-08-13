@@ -130,7 +130,6 @@ def upsert_contact(uuid: str, name: str, ip: str, ws_port: int = 50002):
             contacts[uuid]["ws_port"] = ws_port
             contacts[uuid]["last_contact"] = now
             contacts[uuid]["trusted"] = True  # 重连后恢复信任
-            contacts[uuid]["deleted"] = False  # 清除墓碑：重新建立连接后恢复正常联系人
             # 如果旧数据没有 messages 字段，补上
             if "messages" not in contacts[uuid]:
                 contacts[uuid]["messages"] = []
@@ -227,24 +226,23 @@ def mark_contact_untrusted(uuid: str):
 
 
 def delete_contact(uuid: str):
-    """
-    删除联系人：保留"墓碑"记录（deleted=true, trusted=false），清空聊天记录。
-    墓碑用于重连时判断"我删除过对方"，从而在连接请求中带上 deleted_you 标志，
-    强制对方重新验证（而非自动接受）。list_contacts 会过滤掉墓碑，不影响前端显示。
-    """
+    """删除联系人及其聊天记录（完整删除，不留任何记录）。"""
     with _contacts_lock:
         contacts = _load_contacts_unsafe()
         if uuid in contacts:
-            contacts[uuid]["trusted"] = False
-            contacts[uuid]["deleted"] = True
-            contacts[uuid]["messages"] = []
+            del contacts[uuid]
             _save_contacts_unsafe(contacts)
 
 
-def get_deleted_uuids() -> list[str]:
-    """返回所有已删除（墓碑）联系人的 UUID 列表"""
-    contacts = load_contacts()
-    return [uuid for uuid, info in contacts.items() if info.get("deleted", False)]
+def remove_deleted_tombstones():
+    """一次性清理旧版本（v32）遗留的墓碑记录（deleted=true），改回完整删除语义。"""
+    with _contacts_lock:
+        contacts = _load_contacts_unsafe()
+        stale = [uuid for uuid, info in contacts.items() if info.get("deleted", False)]
+        if stale:
+            for uuid in stale:
+                del contacts[uuid]
+            _save_contacts_unsafe(contacts)
 
 
 def list_contacts() -> list[dict]:
@@ -252,8 +250,6 @@ def list_contacts() -> list[dict]:
     contacts = load_contacts()
     result = []
     for uuid, info in contacts.items():
-        if info.get("deleted", False):
-            continue  # 过滤墓碑（已删除的联系人）
         result.append({
             "uuid": uuid,
             "name": info.get("name", "Unknown"),
