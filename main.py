@@ -11,6 +11,7 @@ LanChat 主程序 —— FastAPI 后端。
 
 import asyncio
 import base64
+import logging
 import os
 import socket
 import threading
@@ -26,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from discovery import Discovery, TokenManager
+from discovery import Discovery, TokenManager, get_network_interfaces
 from storage import (
     append_message,
     cleanup_expired_progress,
@@ -45,6 +46,14 @@ from storage import (
     upsert_contact,
 )
 
+LOG_LEVEL = os.environ.get("LANCHAT_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("lanchat")
+
 # ============================================================
 # 配置初始化
 # ============================================================
@@ -52,6 +61,10 @@ from storage import (
 
 def get_local_ip() -> str:
     """获取本机局域网 IP（优先外网探测，无外网时枚举网卡）"""
+    bind_ip = os.environ.get("LANCHAT_BIND_IP", "").strip()
+    if bind_ip:
+        return bind_ip
+
     # 方法1：通过连接外网获取（有互联网时最可靠）
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -67,7 +80,7 @@ def get_local_ip() -> str:
     try:
         import fcntl
         import struct
-        for iface_name, _ in socket.if_nameindex():
+        for _, iface_name in socket.if_nameindex():
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 ip_bytes = fcntl.ioctl(
@@ -83,7 +96,12 @@ def get_local_ip() -> str:
     except (ImportError, OSError, AttributeError):
         pass
 
-    # 方法3：通过 getaddrinfo 解析本机名兜底
+    # 方法3：复用 discovery 的跨平台网卡枚举结果
+    for interface in get_network_interfaces():
+        if interface.ip != "0.0.0.0":
+            return interface.ip
+
+    # 方法4：通过 getaddrinfo 解析本机名兜底
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
@@ -93,7 +111,7 @@ def get_local_ip() -> str:
     except OSError:
         pass
 
-    # 方法4：通过系统命令获取本机 IP（Linux hostname -I / ip addr / Windows ipconfig）
+    # 方法5：通过系统命令获取本机 IP（Linux hostname -I / ip addr / Windows ipconfig）
     try:
         import subprocess
         import re
@@ -176,7 +194,11 @@ WS_PORT: int = int(_env_port) if _env_port else find_available_port()
 MY_UUID: str = f"{config['uuid']}_{WS_PORT}"  # 端口后缀确保同机多实例 UUID 唯一
 MY_NAME: str = config.get("name", socket.gethostname())
 MY_IP: str = get_local_ip()
-NETWORK_SEGMENT: str = ".".join(MY_IP.split(".")[:3]) + ".0/24"
+_my_interface = next(
+    (interface for interface in get_network_interfaces() if interface.ip == MY_IP),
+    None,
+)
+NETWORK_SEGMENT: str = _my_interface.network if _my_interface else f"{MY_IP}/32"
 
 # 清理过期进度文件
 cleanup_expired_progress(max_age_hours=24)
@@ -236,12 +258,19 @@ async def lifespan(app: FastAPI):
     discovery.start()
     # 启动后探活已存联系人（跨子网场景自动发现）
     asyncio.create_task(_probe_saved_contacts())
-    print(f"[LanChat] 已启动: http://localhost:{WS_PORT}")
-    print(f"  昵称: {MY_NAME}  网段: {NETWORK_SEGMENT}")
+    logger.info("服务已启动 url=http://localhost:%s", WS_PORT)
+    logger.info(
+        "本机信息 name=%s uuid=%s ip=%s network=%s port=%s",
+        MY_NAME,
+        MY_UUID,
+        MY_IP,
+        NETWORK_SEGMENT,
+        WS_PORT,
+    )
     yield
     # 关闭
     discovery.stop()
-    print("[LanChat] 已停止")
+    logger.info("服务已停止")
 
 
 def _make_threadsafe(async_func):
@@ -273,7 +302,14 @@ async def _verify_token_via_api(uuid: str, token: str, ip: str, port: int) -> bo
 
         data = await asyncio.to_thread(_fetch)
         return data.get("uuid") == uuid and data.get("token") == token
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "HTTP Token 验证失败 uuid=%s target=%s:%s error=%s",
+            uuid,
+            ip,
+            port,
+            exc,
+        )
         return False
 
 
@@ -335,10 +371,16 @@ async def _probe_saved_contacts():
                             await _notify_peer_online(
                                 discovery._peers[c["uuid"]].copy()
                             )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "联系人 HTTP 探活失败 uuid=%s target=%s:%s error=%s",
+                        c.get("uuid", ""),
+                        ip,
+                        c.get("ws_port", 50002),
+                        exc,
+                    )
         except Exception:
-            pass
+            logger.exception("联系人 HTTP 探活循环异常")
 
         await asyncio.sleep(PROBE_INTERVAL)
 
@@ -387,6 +429,10 @@ async def _notify_peer_offline(peer: dict):
     # 对方正通过 chat WS 连着本机时，UDP 超时不应推 offline（跨子网/丢包误报）
     with _chats_lock:
         if peer_uuid and peer_uuid in active_chats:
+            logger.info(
+                "忽略 UDP 离线通知，Chat WebSocket 仍连接 uuid=%s",
+                peer_uuid,
+            )
             return
     if control_ws:
         try:
@@ -1010,7 +1056,19 @@ async def ws_chat(ws: WebSocket):
 
         # Token 验证：优先查 UDP peer_list（同子网），失败则反向调 /api/me（跨子网）
         if not discovery.verify_token(peer_uuid, peer_token):
+            logger.info(
+                "UDP Token 验证未命中，尝试 HTTP 验证 uuid=%s ip=%s port=%s",
+                peer_uuid,
+                peer_ip,
+                peer_ws_port,
+            )
             if not await _verify_token_via_api(peer_uuid, peer_token, peer_ip, peer_ws_port):
+                logger.warning(
+                    "连接拒绝：Token 验证失败 uuid=%s ip=%s port=%s",
+                    peer_uuid,
+                    peer_ip,
+                    peer_ws_port,
+                )
                 await ws.send_json({"type": "connect_rejected", "reason": "invalid_token"})
                 await ws.close()
                 return
@@ -1109,6 +1167,12 @@ async def ws_chat(ws: WebSocket):
             "ip": peer_ip,
         })
         await _notify_pending_update()
+        logger.info(
+            "Chat WebSocket 已建立 uuid=%s name=%s ip=%s",
+            peer_uuid,
+            peer_name,
+            peer_ip,
+        )
 
         while True:
             try:
@@ -1137,9 +1201,9 @@ async def ws_chat(ws: WebSocket):
             await _relay_from_peer(ws, peer_uuid, peer_name, msg)
 
     except WebSocketDisconnect:
-        pass
+        logger.info("Chat WebSocket 已断开 uuid=%s name=%s", peer_uuid, peer_name)
     except Exception:
-        pass
+        logger.exception("Chat WebSocket 异常 uuid=%s name=%s", peer_uuid, peer_name)
     finally:
         # 清理
         with _pending_lock:
@@ -1511,6 +1575,8 @@ if __name__ == "__main__":
     #   LANCHAT_DATA_DIR - 数据目录路径（默认 ./data）
     #   LANCHAT_PORT      - 指定端口（默认自动查找 50002+）
     #   LANCHAT_NAME      - 自定义昵称
+    #   LANCHAT_BIND_IP   - 指定用于发现与回连的网卡 IPv4
+    #   LANCHAT_LOG_LEVEL - 日志级别（默认 INFO，诊断时可设 DEBUG）
     port = int(os.environ.get("LANCHAT_PORT", "0")) or WS_PORT
     name = os.environ.get("LANCHAT_NAME", "")
     if name:
@@ -1519,8 +1585,10 @@ if __name__ == "__main__":
         save_config(config)
         discovery.my_name = name
 
-    print(f"[LanChat] 启动中...")
-    print(f"  昵称: {MY_NAME}")
-    print(f"  网段: {NETWORK_SEGMENT}")
-    print(f"  端口: {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    logger.info("启动中 name=%s ip=%s network=%s port=%s", MY_NAME, MY_IP, NETWORK_SEGMENT, port)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level=os.environ.get("UVICORN_LOG_LEVEL", "warning"),
+    )

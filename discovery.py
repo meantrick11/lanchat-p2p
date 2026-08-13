@@ -10,11 +10,18 @@ UDP 节点发现模块。
 """
 
 import json
+import ipaddress
+import logging
+import os
 import socket
 import secrets
+import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
+
+logger = logging.getLogger("lanchat.discovery")
 
 # UDP 广播端口
 BROADCAST_PORT = 50001
@@ -51,116 +58,198 @@ class TokenManager:
         return self.current
 
 
-# 缓存：网卡信息不会频繁变化，60 秒刷新一次，避免 ipconfig 每 3 秒调一次
-_cached_interfaces: list[tuple[str, str]] | None = None
+# 缓存：网卡信息不会频繁变化，60 秒刷新一次，避免每 3 秒枚举系统网卡
+@dataclass(frozen=True)
+class NetworkInterface:
+    """一张可用于局域网发现的 IPv4 网卡。"""
+
+    name: str
+    ip: str
+    netmask: str
+    network: str
+    broadcast: str
+
+
+_cached_interfaces: list[NetworkInterface] | None = None
 _cached_interfaces_time: float = 0
 _CACHE_TTL = 60  # 秒
 
 
-def _get_broadcast_interfaces() -> list[tuple[str, str]]:
-    """
-    获取所有活跃网卡的 (广播地址, 网卡IP) 列表（带缓存）。
-    每张网卡的广播包应携带该网卡自己的 IP，这样多网卡主机在
-    不同子网收到广播的对端才能用正确的 IP 回连。
+def _build_interface(name: str, ip: str, netmask: str) -> NetworkInterface:
+    """根据 IPv4 地址和真实掩码构造网卡网络信息。"""
+    interface = ipaddress.IPv4Interface(f"{ip}/{netmask}")
+    return NetworkInterface(
+        name=name,
+        ip=str(interface.ip),
+        netmask=str(interface.netmask),
+        network=str(interface.network),
+        broadcast=str(interface.network.broadcast_address),
+    )
 
-    Linux: 通过 ioctl 获取准确的 IP + 子网掩码 → 广播地址
-    Windows/fallback: 通过 getaddrinfo 枚举 IP，按 /24 估算广播地址
+
+def _is_usable_ip(ip: str) -> bool:
+    """过滤回环、链路本地和未指定地址。"""
+    try:
+        address = ipaddress.IPv4Address(ip)
+        return not (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_unspecified
+        )
+    except ipaddress.AddressValueError:
+        return False
+
+
+def _get_linux_interfaces() -> list[NetworkInterface]:
+    """通过 ioctl 枚举 Linux IPv4 网卡及真实掩码。"""
+    try:
+        import fcntl
+        import struct
+    except ImportError:
+        return []
+
+    interfaces: list[NetworkInterface] = []
+    if not hasattr(socket, "if_nameindex"):
+        return interfaces
+
+    # socket.if_nameindex() 返回 (index, name)，名称在第二项。
+    for _, iface_name in socket.if_nameindex():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            packed_name = struct.pack("256s", iface_name[:15].encode())
+            ip_bytes = fcntl.ioctl(sock.fileno(), 0x8915, packed_name)[20:24]
+            mask_bytes = fcntl.ioctl(sock.fileno(), 0x891B, packed_name)[20:24]
+            ip = socket.inet_ntoa(ip_bytes)
+            netmask = socket.inet_ntoa(mask_bytes)
+            if _is_usable_ip(ip):
+                interfaces.append(_build_interface(iface_name, ip, netmask))
+        except OSError:
+            logger.debug("跳过无法读取 IPv4 信息的 Linux 网卡: %s", iface_name)
+        finally:
+            sock.close()
+    return interfaces
+
+
+def _get_windows_interfaces() -> list[NetworkInterface]:
+    """通过 PowerShell JSON 枚举 Windows IPv4 网卡，避免依赖 ipconfig 语言。"""
+    if os.name != "nt":
+        return []
+
+    command = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Get-NetIPAddress -AddressFamily IPv4 | "
+        "Where-Object {$_.AddressState -eq 'Preferred'} | "
+        "Select-Object InterfaceAlias,IPAddress,PrefixLength | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+        if result.returncode != 0:
+            logger.warning("PowerShell 网卡枚举失败: %s", result.stderr.strip())
+            return []
+
+        raw = result.stdout.strip()
+        if not raw:
+            return []
+        records = json.loads(raw)
+        if isinstance(records, dict):
+            records = [records]
+
+        interfaces = []
+        for record in records:
+            ip = str(record.get("IPAddress", ""))
+            prefix = int(record.get("PrefixLength", 0))
+            if not _is_usable_ip(ip) or not 1 <= prefix <= 30:
+                continue
+            interfaces.append(
+                _build_interface(
+                    str(record.get("InterfaceAlias", "unknown")),
+                    ip,
+                    str(prefix),
+                )
+            )
+        return interfaces
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Windows 网卡枚举异常: %s", exc)
+        return []
+
+
+def _get_fallback_interfaces() -> list[NetworkInterface]:
+    """系统枚举不可用时通过主机名解析兜底（掩码只能保守估算为 /24）。"""
+    interfaces = []
+    try:
+        seen = set()
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not _is_usable_ip(ip) or ip in seen:
+                continue
+            seen.add(ip)
+            interfaces.append(_build_interface("fallback", ip, "24"))
+    except OSError as exc:
+        logger.warning("兜底网卡枚举失败: %s", exc)
+    return interfaces
+
+
+def get_network_interfaces() -> list[NetworkInterface]:
+    """
+    获取所有活跃 IPv4 网卡（带缓存）。
+
+    LANCHAT_BIND_IP 可限制只使用指定网卡，适合 WSL/VMware 等多网卡环境。
     """
     global _cached_interfaces, _cached_interfaces_time
 
     now = time.time()
     if _cached_interfaces is not None and (now - _cached_interfaces_time) < _CACHE_TTL:
-        return _cached_interfaces
-    import struct
-    interfaces = []
+        return list(_cached_interfaces)
 
-    # Linux: ioctl 获取各网卡 IP + 子网掩码，计算定向广播地址
-    try:
-        import fcntl
-        if hasattr(socket, "if_nameindex"):
-            for iface_name, _ in socket.if_nameindex():
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    ip_bytes = fcntl.ioctl(
-                        s.fileno(), 0x8915,
-                        struct.pack("256s", iface_name[:15].encode())
-                    )[20:24]
-                    mask_bytes = fcntl.ioctl(
-                        s.fileno(), 0x891b,
-                        struct.pack("256s", iface_name[:15].encode())
-                    )[20:24]
-                    s.close()
-                    ip = socket.inet_ntoa(ip_bytes)
-                    netmask = socket.inet_ntoa(mask_bytes)
-                    if ip == "127.0.0.1" or not ip or not netmask:
-                        continue
-                    ip_parts = [int(p) for p in ip.split(".")]
-                    mask_parts = [int(p) for p in netmask.split(".")]
-                    broadcast_parts = [
-                        str(ip_parts[i] | (255 ^ mask_parts[i])) for i in range(4)
-                    ]
-                    bcast = ".".join(broadcast_parts)
-                    if (bcast, ip) not in interfaces:
-                        interfaces.append((bcast, ip))
-                except Exception:
-                    continue
-    except (ImportError, OSError):
-        pass
-
-    # Windows / fallback: 枚举所有非回环 IPv4，按 /24 估算广播地址
+    interfaces = (
+        _get_windows_interfaces()
+        if os.name == "nt"
+        else _get_linux_interfaces()
+    )
     if not interfaces:
-        try:
-            seen = set()
-            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-                ip = info[4][0]
-                if ip == "127.0.0.1" or ip in seen:
-                    continue
-                seen.add(ip)
-                parts = ip.split(".")
-                bcast = ".".join(parts[:3]) + ".255"
-                interfaces.append((bcast, ip))
-        except OSError:
-            pass
+        interfaces = _get_fallback_interfaces()
 
-    # Windows: 通过 ipconfig 获取所有网卡 IP + 子网掩码
-    # （getaddrinfo 可能遗漏虚拟网卡如 VMware Host-Only；正则适配中/英文系统）
-    try:
-        import subprocess
-        import re
-        result = subprocess.run(
-            ["ipconfig"], capture_output=True, text=True, timeout=5
-        )
-        current_ip = None
-        for line in result.stdout.splitlines():
-            # "   IPv4 Address.......: x.x.x.x" / "   IPv4 地址........: x.x.x.x"
-            m_ip = re.search(r'IPv4[^:]*?:\s*([\d.]+)', line)
-            # "   Subnet Mask.......: y.y.y.y" / "   子网掩码.........: y.y.y.y"
-            m_mask = re.search(r'(?:Subnet Mask|子网掩码)[^:]*?:\s*([\d.]+)', line)
+    # 去重，避免同一 IP 被多个系统接口查询重复返回。
+    interfaces = list({item.ip: item for item in interfaces}.values())
 
-            if m_ip:
-                current_ip = m_ip.group(1)
-                if current_ip == "127.0.0.1":
-                    current_ip = None
-            elif m_mask and current_ip:
-                mask = m_mask.group(1)
-                ip_parts = [int(p) for p in current_ip.split(".")]
-                mask_parts = [int(p) for p in mask.split(".")]
-                bcast = ".".join(
-                    [str(ip_parts[i] | (255 ^ mask_parts[i])) for i in range(4)]
-                )
-                if (bcast, current_ip) not in interfaces:
-                    interfaces.append((bcast, current_ip))
-                current_ip = None
-    except Exception:
-        pass
+    bind_ip = os.environ.get("LANCHAT_BIND_IP", "").strip()
+    if bind_ip:
+        selected = [item for item in interfaces if item.ip == bind_ip]
+        if selected:
+            interfaces = selected
+        else:
+            logger.warning(
+                "LANCHAT_BIND_IP=%s 未匹配任何可用网卡，将使用自动枚举结果",
+                bind_ip,
+            )
 
-    # 最后的兜底
     if not interfaces:
-        interfaces.append(("255.255.255.255", "0.0.0.0"))
+        interfaces = [
+            NetworkInterface(
+                name="fallback",
+                ip="0.0.0.0",
+                netmask="0.0.0.0",
+                network="0.0.0.0/0",
+                broadcast="255.255.255.255",
+            )
+        ]
 
     _cached_interfaces = interfaces
     _cached_interfaces_time = time.time()
-    return interfaces
+    return list(interfaces)
+
+
+def _get_broadcast_interfaces() -> list[tuple[str, str]]:
+    """返回兼容格式的 (广播地址, 网卡 IP) 列表。"""
+    return [(item.broadcast, item.ip) for item in get_network_interfaces()]
 
 
 # 保留旧函数名的兼容引用
@@ -207,6 +296,14 @@ class Discovery:
     def start(self):
         """启动发现服务（广播 + 监听）"""
         self._running = True
+        for interface in get_network_interfaces():
+            logger.info(
+                "发现网卡 name=%s ip=%s network=%s broadcast=%s",
+                interface.name,
+                interface.ip,
+                interface.network,
+                interface.broadcast,
+            )
 
         # 创建 UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -231,8 +328,8 @@ class Discovery:
             for bcast_addr, _ in _get_broadcast_interfaces():
                 try:
                     self._sock.sendto(goodbye.encode(), (bcast_addr, BROADCAST_PORT))
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.warning("发送 goodbye 失败 target=%s error=%s", bcast_addr, exc)
             try:
                 self._sock.close()
             except OSError:
@@ -284,8 +381,20 @@ class Discovery:
             })
             try:
                 self._sock.sendto(msg.encode(), (bcast_addr, BROADCAST_PORT))
-            except OSError:
-                pass
+                logger.debug(
+                    "发送 UDP 心跳 source=%s target=%s:%s",
+                    ip,
+                    bcast_addr,
+                    BROADCAST_PORT,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "发送 UDP 心跳失败 source=%s target=%s:%s error=%s",
+                    ip,
+                    bcast_addr,
+                    BROADCAST_PORT,
+                    exc,
+                )
 
     def _broadcast_loop(self):
         """后台广播循环：每 HEARTBEAT_INTERVAL 秒发一次心跳"""
@@ -300,26 +409,27 @@ class Discovery:
             try:
                 data, addr = self._sock.recvfrom(4096)
                 msg = json.loads(data.decode("utf-8"))
-                self._handle_message(msg)
+                self._handle_message(msg, addr[0])
             except socket.timeout:
                 # 定时超时，用于检查离线节点和退出信号
                 self._check_timeouts()
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                if self._running:
+                    logger.debug("忽略无效 UDP 数据或接收异常: %s", exc)
                 continue
 
     def _is_same_subnet(self, ip: str) -> bool:
         """判断 IP 是否与本机任一网卡同子网（用于多网卡广播去重）"""
-        if not ip or ip == "127.0.0.1":
+        if not _is_usable_ip(ip):
             return False
-        for _, iface_ip in _get_broadcast_interfaces():
-            if iface_ip == "0.0.0.0":
-                continue
-            # 按 /24 子网比较前 3 段
-            if iface_ip.rsplit(".", 1)[0] == ip.rsplit(".", 1)[0]:
-                return True
-        return False
+        address = ipaddress.IPv4Address(ip)
+        return any(
+            address in ipaddress.IPv4Network(interface.network)
+            for interface in get_network_interfaces()
+            if interface.ip != "0.0.0.0"
+        )
 
-    def _handle_message(self, msg: dict):
+    def _handle_message(self, msg: dict, source_ip: str = ""):
         """处理收到的广播消息"""
         uuid = msg.get("uuid", "")
         if uuid == self.my_uuid:
@@ -337,6 +447,17 @@ class Discovery:
                 prev_data = self._peers.get(uuid, {})
                 new_ip = msg.get("ip", "")
                 prev_ip = prev_data.get("ip", "")
+
+                # UDP 发现仅接受本机真实子网中的地址，防止 WSL/VPN/VMware
+                # 网卡广播穿透后用不可达地址覆盖正确的局域网地址。
+                if not self._is_same_subnet(new_ip):
+                    logger.debug(
+                        "忽略非本地子网心跳 uuid=%s advertised_ip=%s source_ip=%s",
+                        uuid,
+                        new_ip,
+                        source_ip,
+                    )
+                    return
 
                 # 多网卡广播去重：只接受同子网的 IP，防止虚拟机/VPN 网卡的
                 # 广播覆盖了真正的局域网 IP（最后到达的包会覆盖先前的）
@@ -367,11 +488,20 @@ class Discovery:
                 updated = name_changed or ip_changed
                 if self.on_peer_online and (is_new or was_offline or updated):
                     self.on_peer_online(self._peers[uuid].copy())
+                if is_new or was_offline:
+                    logger.info(
+                        "节点上线 uuid=%s name=%s ip=%s source_ip=%s",
+                        uuid,
+                        self._peers[uuid]["name"],
+                        use_ip,
+                        source_ip,
+                    )
 
             elif msg_type == "goodbye":
                 if uuid in self._peers:
                     self._peers[uuid]["status"] = "offline"
                     self._peers[uuid]["last_seen"] = time.time()
+                    logger.info("节点主动下线 uuid=%s ip=%s", uuid, self._peers[uuid].get("ip"))
                     if self.on_peer_offline:
                         self.on_peer_offline(self._peers[uuid].copy())
 
@@ -392,5 +522,11 @@ class Discovery:
 
         # 在锁外触发回调，避免死锁
         for peer in offline_notifications:
+            logger.info(
+                "节点心跳超时 uuid=%s ip=%s miss_count=%s",
+                peer.get("uuid"),
+                peer.get("ip"),
+                peer.get("miss_count"),
+            )
             if self.on_peer_offline:
                 self.on_peer_offline(peer)
