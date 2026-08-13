@@ -468,6 +468,17 @@ async def _notify_pending_update():
         count = len(pending_connections)
     await _notify_browser({"type": "pending_update", "count": count})
 
+
+def _contact_list_status(uuid: str, online_peer_ids: set[str]) -> str:
+    """
+    联系人列表展示用在线状态。
+    已有 Chat WS 会话时不受 UDP 离线影响；否则才看 UDP 发现结果。
+    """
+    with _chats_lock:
+        if uuid in active_chats:
+            return "online"
+    return "online" if uuid in online_peer_ids else "offline"
+
 # ============================================================
 # REST API
 # ============================================================
@@ -499,9 +510,9 @@ async def api_contacts():
     在线列表里的人显示 🟢，不在的显示 🔴。
     """
     contacts = list_contacts()
-    online_peers = {p["uuid"]: p for p in discovery.get_peers()}
+    online_peer_ids = {p["uuid"] for p in discovery.get_peers()}
     for c in contacts:
-        c["status"] = "online" if c["uuid"] in online_peers else "offline"
+        c["status"] = _contact_list_status(c["uuid"], online_peer_ids)
     return contacts
 
 
@@ -580,7 +591,7 @@ async def ws_control(ws: WebSocket):
     online_peers_list = [p for p in discovery.get_peers() if p.get("uuid") != MY_UUID]
     online_peer_ids = {p["uuid"] for p in online_peers_list}
     for c in init_contacts:
-        c["status"] = "online" if c["uuid"] in online_peer_ids else "offline"
+        c["status"] = _contact_list_status(c["uuid"], online_peer_ids)
 
     await ws.send_json({
         "type": "init",

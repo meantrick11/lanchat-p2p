@@ -20,6 +20,31 @@ let pendingRequests = new Map();
 let activeChats = new Map();         // uuid → WebSocket（主动发起方有值）
 let connectedPeers = new Set();      // 连接已确认的 peer uuid（双方向都追踪，含接收方）
 let currentChat = null;
+
+/** Chat WS 已建立且未断开；会话态只认此状态，与 UDP 发现无关 */
+function isPeerConnected(uuid) {
+    const chatWs = activeChats.get(uuid);
+    return (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(uuid);
+}
+
+/** UDP 发现：仅表示局域网内可见，用于未连接时的在线列表与发起连接 */
+function isPeerDiscoverable(uuid) {
+    return onlinePeers.has(uuid);
+}
+
+/** 获取对端地址：已连接时用 contacts 缓存，未连接时用 UDP 在线列表 */
+function getPeerEndpoint(uuid) {
+    const fromOnline = onlinePeers.get(uuid);
+    const fromContact = contacts.get(uuid);
+    if (isPeerConnected(uuid) && fromContact) {
+        return {
+            name: fromContact.name || fromOnline?.name || 'Unknown',
+            ip: fromContact.ip || fromOnline?.ip || '',
+            ws_port: fromContact.ws_port || fromOnline?.ws_port || 50002,
+        };
+    }
+    return fromOnline || fromContact || null;
+}
 let pendingMessages = new Map();
 let controlWs = null;
 let reconnectTimer = null;
@@ -298,16 +323,14 @@ function handlePeerOnline(msg) {
 
 function handlePeerOffline(msg) {
     onlinePeers.delete(msg.uuid);
-    if (contacts.has(msg.uuid)) {
+    // 已建立 Chat 连接时，UDP offline 不影响联系人/会话状态
+    if (contacts.has(msg.uuid) && !isPeerConnected(msg.uuid)) {
         contacts.get(msg.uuid).status = 'offline';
     }
-    // UDP 心跳丢失不代表 TCP chat WS 已断，不在此处关闭连接。
-    // 连接是否存活由 ws.onclose / 后端 peer_disconnected 决定。
-    const stillConnected = activeChats.has(msg.uuid) || connectedPeers.has(msg.uuid);
     renderOnlineList();
     renderContactsList();
     updateChatHeaderStatus();
-    if (!stillConnected) {
+    if (!isPeerConnected(msg.uuid)) {
         addSystemMessage(msg.uuid, `${msg.name} 已下线`);
     }
 }
@@ -796,14 +819,18 @@ function updateContacts(list) {
             contacts.set(c.uuid, {
                 name: c.name,
                 ip: c.ip,
-                status: c.status,
+                ws_port: c.ws_port || 50002,
+                status: isPeerConnected(c.uuid) ? 'online' : c.status,
                 trusted: c.trusted !== false,  // 默认 true，兼容旧数据
                 messages: [],
             });
         } else {
-            contacts.get(c.uuid).status = c.status;
+            if (!isPeerConnected(c.uuid)) {
+                contacts.get(c.uuid).status = c.status;
+            }
             contacts.get(c.uuid).name = c.name || contacts.get(c.uuid).name;
             contacts.get(c.uuid).ip = c.ip || contacts.get(c.uuid).ip;
+            if (c.ws_port) contacts.get(c.uuid).ws_port = c.ws_port;
             if (c.trusted !== undefined) {
                 contacts.get(c.uuid).trusted = c.trusted;
             }
@@ -816,6 +843,9 @@ function updateContacts(list) {
 function renderContactsList() {
     const list = Array.from(contacts.entries())
         .sort((a, b) => {
+            const aConn = isPeerConnected(a[0]);
+            const bConn = isPeerConnected(b[0]);
+            if (aConn !== bConn) return aConn ? -1 : 1;
             // 在线排前面，同状态按名字排序
             if (a[1].status !== b[1].status) return a[1].status === 'online' ? -1 : 1;
             return a[1].name.localeCompare(b[1].name);
@@ -831,14 +861,13 @@ function renderContactsList() {
     for (const [uuid, contact] of list) {
         const div = document.createElement('div');
         div.className = `item${currentChat === uuid ? ' active' : ''}`;
-        // 用实时在线列表判断状态
-        const isOnline = onlinePeers.has(uuid);
-        const dotClass = isOnline ? 'online' : 'offline';
-        const isConnected = getConnectionLabel(uuid) !== '';
+        // UDP 发现仅用于未连接时的在线指示；已连接优先显示会话态
+        const isConnected = isPeerConnected(uuid);
+        const isDiscoverable = isPeerDiscoverable(uuid);
+        const dotClass = isConnected ? 'online' : (isDiscoverable ? 'online' : 'offline');
         const connLabel = isConnected ? ' 🔗已连接' : '';
-        const statusText = isOnline ? connLabel : ' (离线)';
-        // 在线但未连接 → 显示连接按钮
-        const connBtn = (isOnline && !isConnected) ?
+        const statusText = isConnected ? connLabel : (isDiscoverable ? '' : ' (离线)');
+        const connBtn = (isDiscoverable && !isConnected) ?
             `<button class="btn-connect" data-uuid="${uuid}">连接</button>` : '';
         div.innerHTML = `
             <span class="dot ${dotClass}"></span>
@@ -857,7 +886,7 @@ function renderContactsList() {
             openChat(uuid);
         });
         // 点击连接按钮 → 发起连接
-        if (isOnline && !isConnected) {
+        if (isDiscoverable && !isConnected) {
             div.querySelector('.btn-connect').addEventListener('click', (e) => {
                 e.stopPropagation();
                 connectToPeer(uuid, contact.name, contact.ip);
@@ -921,8 +950,8 @@ async function autoReconnect(uuid) {
     // 不重复连接
     if (activeChats.has(uuid)) return;
 
-    const peer = onlinePeers.get(uuid);
-    if (!peer) return; // 对方不在线，无法重连
+    const peer = onlinePeers.get(uuid) || contacts.get(uuid);
+    if (!peer || !peer.ip) return; // 无地址信息，无法重连
 
     const name = peer.name;
     const ip = peer.ip;
@@ -1017,7 +1046,7 @@ async function connectToPeer(uuid, name, ip) {
 
     openChat(uuid); // 先打开聊天窗口，显示"连接中..."
 
-    // 连接前先刷新自己的 token（token 每3秒更新，避免用过期的）
+    // 连接前先刷新自己的 token（token 每 3 秒更新，避免用过期的）
     try {
         const resp = await fetch('/api/me');
         const me = await resp.json();
@@ -1562,27 +1591,24 @@ async function deleteCurrentContact() {
 
 function updateChatHeaderStatus() {
     if (!currentChat) return;
-    const online = onlinePeers.has(currentChat);
     const chatWs = activeChats.get(currentChat);
-    const wsConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(currentChat);
+    const wsConnected = isPeerConnected(currentChat);
+    const discoverable = isPeerDiscoverable(currentChat);
 
-    // 在线 + 已连接 = 绿色；在线但未连接 = 黄色；离线 = 灰色
-    // 注意：跨子网/手动连接时对方可能不在 onlinePeers 但已建立连接，此时仍应显示已连接
     let statusText, statusClass;
     if (wsConnected) {
         statusText = '🟢 已连接';
         statusClass = 'online';
-    } else if (online) {
+    } else if (discoverable) {
         statusText = '🟡 在线（未建立聊天连接）';
         statusClass = 'online';
     } else {
-        statusText = '🔴 离线';
+        statusText = '🔴 未发现';
         statusClass = 'offline';
     }
     chatPeerStatus.textContent = statusText;
     chatPeerStatus.className = statusClass;
-    chatConnectBar.style.display = (online && !wsConnected) ? '' : 'none';
-    // 显示/隐藏断开按钮：仅当已连接时显示
+    chatConnectBar.style.display = (discoverable && !wsConnected) ? '' : 'none';
     btnDisconnect.style.display = wsConnected ? '' : 'none';
 }
 
@@ -1591,15 +1617,9 @@ function sendCurrentMessage() {
     const content = msgInput.value.trim();
     if (!content || !currentChat) return;
 
-    // 连接状态检查（输入框始终可用，发送时才校验）
-    const online = onlinePeers.has(currentChat);
+    // 会话态：仅校验 Chat WS 是否已连接，不依赖 UDP 在线列表
     const chatWs = activeChats.get(currentChat);
-    const wsConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(currentChat);
-    if (!online) {
-        showCenterToast('对方当前不在线，等待对方上线后才能聊天嗷~');
-        return;
-    }
-    if (!wsConnected) {
+    if (!isPeerConnected(currentChat)) {
         showCenterToast('连接按钮都懒得点，那就别想和我聊天~');
         return;
     }
@@ -1776,16 +1796,7 @@ function onFileSelected() {
         return;
     }
 
-    // 连接状态检查（文件选择始终可用，发送时才校验）
-    const online = onlinePeers.has(currentChat);
-    const chatWs = activeChats.get(currentChat);
-    const wsConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(currentChat);
-    if (!online) {
-        showCenterToast('对方当前不在线，等待对方上线后才能聊天嗷~');
-        fileInput.value = '';
-        return;
-    }
-    if (!wsConnected) {
+    if (!isPeerConnected(currentChat)) {
         showCenterToast('连接按钮都懒得点，那就别想和我聊天~');
         fileInput.value = '';
         return;
@@ -1799,15 +1810,7 @@ function onFileSelected() {
  * 发送文件：添加文件消息气泡 → 发 file_request → 等对方响应后自动开始上传。
  */
 async function sendFile(uuid, file) {
-    // 防守检查：未建立连接时不允许发送文件
-    const online = onlinePeers.has(uuid);
-    const chatWs = activeChats.get(uuid);
-    const wsConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(uuid);
-    if (!online) {
-        showCenterToast('对方当前不在线，等待对方上线后才能聊天嗷~');
-        return;
-    }
-    if (!wsConnected) {
+    if (!isPeerConnected(uuid)) {
         showCenterToast('连接按钮都懒得点，那就别想和我聊天~');
         return;
     }
@@ -1888,9 +1891,9 @@ async function startChunkUpload(transferId) {
         if (currentChat === t.uuid) renderMessages(t.uuid);
     }
 
-    const peer = onlinePeers.get(t.uuid);
-    if (!peer) {
-        showToast('对方不在线，无法发送文件');
+    const peer = getPeerEndpoint(t.uuid);
+    if (!peer || !peer.ip) {
+        showToast('缺少对方地址信息，无法发送文件');
         if (fileMsg) {
             fileMsg.status = 'failed';
             saveFileMessage(t.uuid, fileMsg);
@@ -2011,22 +2014,16 @@ async function retryFileTransfer(transferId) {
         return;
     }
 
-    // 2. 检查对方是否在线
-    const peer = onlinePeers.get(t.uuid);
-    if (!peer) {
-        showCenterToast('对方当前不在线，等待对方上线后才能重传嗷~');
-        return;
-    }
-
-    // 2.5 必须有已建立的 chat WS 连接才能续传（否则 file_request 无法送达）
-    const chatWs = activeChats.get(t.uuid);
-    const isConnected = (chatWs && chatWs.readyState === WebSocket.OPEN) || connectedPeers.has(t.uuid);
-    if (!isConnected) {
+    const peer = getPeerEndpoint(t.uuid);
+    if (!isPeerConnected(t.uuid)) {
         showCenterToast('连接按钮都懒得点，那就别想重传文件~');
         return;
     }
+    if (!peer || !peer.ip) {
+        showCenterToast('缺少对方地址信息，无法重传');
+        return;
+    }
 
-    // 3. 查询接收方已收到的分片数
     let receivedChunks = 0;
     const peerPort = peer.ws_port || 50002;
     try {

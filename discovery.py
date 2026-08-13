@@ -2,10 +2,10 @@
 UDP 节点发现模块。
 
 功能:
-  - 向当前网段广播本机信息（每3秒）
+  - 向当前网段广播本机信息（每0.8秒）
   - 监听其他节点的广播包
   - 维护在线节点列表（含超时检测）
-  - Token 管理（每3秒刷新，随心跳广播分发）
+  - Token 管理（每 3 秒刷新，随 UDP 心跳广播分发）
   - 多网卡支持（每个子网都广播）
 """
 
@@ -26,8 +26,11 @@ logger = logging.getLogger("lanchat.discovery")
 # UDP 广播端口
 BROADCAST_PORT = 50001
 
-# 心跳间隔（秒）
-HEARTBEAT_INTERVAL = 3
+# 心跳间隔（秒）：UDP 广播频率，用于快速发现
+HEARTBEAT_INTERVAL = 0.8
+
+# Token 刷新间隔（秒）：独立于心跳，验证窗口约为 2 倍此值
+TOKEN_REFRESH_INTERVAL = 3
 
 # 节点超时时间（秒）：10秒未收到心跳标记离线
 PEER_TIMEOUT = 10
@@ -37,7 +40,7 @@ MISS_THRESHOLD = 3
 
 
 class TokenManager:
-    """管理本机的会话 Token，每3秒自动刷新。"""
+    """管理本机的会话 Token，每 TOKEN_REFRESH_INTERVAL 秒自动刷新。"""
 
     def __init__(self):
         self.current: str = ""
@@ -52,8 +55,8 @@ class TokenManager:
         self.created_at = time.time()
 
     def get_token(self) -> str:
-        """获取当前 token，超过间隔则自动刷新"""
-        if time.time() - self.created_at > HEARTBEAT_INTERVAL:
+        """获取当前 token，超过 TOKEN_REFRESH_INTERVAL 则自动刷新"""
+        if time.time() - self.created_at > TOKEN_REFRESH_INTERVAL:
             self._refresh()
         return self.current
 
@@ -263,7 +266,7 @@ class Discovery:
     节点发现服务。
 
     启动后：
-      - 广播线程：每 3 秒向所有网卡的广播地址发送心跳包
+      - 广播线程：每 HEARTBEAT_INTERVAL 秒向所有网卡的广播地址发送心跳包
       - 监听线程：持续接收其他节点的心跳包，更新在线列表
     """
 
