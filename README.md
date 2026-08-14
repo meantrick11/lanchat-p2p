@@ -30,7 +30,7 @@ pip install uv
 ```bash
 # 克隆项目
 git clone https://github.com/meantrick11/lanchat-p2p
-cd internproject
+cd lanchat-p2p
 
 # 安装依赖
 uv sync
