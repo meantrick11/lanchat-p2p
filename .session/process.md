@@ -793,3 +793,101 @@ try {
 - `index.html`：缓存版本 v32 → v33
 
 **验证方法**：单机双实例（`LANCHAT_PORT`=50002/50003 + 各自独立 `LANCHAT_DATA_DIR`）跑起来，首次连接需验证 → 断开 → A 删 B → A 再连 B，应再次弹验证而非直接连上。
+
+---
+
+### 34. UDP 离线误伤已建立 Chat WS 修复（2026-08-13）
+
+**问题**：两端已经建立 Chat WebSocket 后，只要 UDP 心跳因丢包、跨子网、虚拟网卡或防火墙原因超时，前端仍会把联系人标记为离线，并可能关闭 Chat WS、禁止发送消息和文件。实际 TCP 连接仍然正常，却被不可靠的 UDP 状态误伤。
+
+**根因分析**：
+- `onlinePeers` 同时承担“UDP 是否可发现”和“聊天是否已连接”两个职责
+- `handlePeerOffline()` 原本会关闭 `activeChats` 中的 WebSocket
+- 发送消息、发送文件和文件重传同时检查 UDP 在线状态与 WS 连接状态
+- `/api/contacts` 和 control WS 初始化数据只根据 UDP peer list 计算 `status`，轮询时会覆盖前端的已连接状态
+
+**第一阶段修复**：
+- `handlePeerOffline()` 不再调用 `ws.close()`，连接是否存活改由 `ws.onclose` / `peer_disconnected` 决定
+- 后端 `_notify_peer_offline()` 检查 `active_chats`，Chat WS 仍存在时不推送 UDP 离线通知
+- `_probe_saved_contacts()` 对所有历史联系人执行 HTTP 探活，不再跳过已经被 UDP 发现的联系人
+
+**完整解耦**（`static/app.js`）：
+```javascript
+function isPeerConnected(uuid) {
+    const chatWs = activeChats.get(uuid);
+    return (chatWs && chatWs.readyState === WebSocket.OPEN)
+        || connectedPeers.has(uuid);
+}
+
+function isPeerDiscoverable(uuid) {
+    return onlinePeers.has(uuid);
+}
+```
+
+- 联系人列表和聊天头部优先显示 `isPeerConnected()` 的会话状态
+- `handlePeerOffline()` 只从 `onlinePeers` 删除节点；连接仍在时不修改联系人状态、不提示下线
+- `sendCurrentMessage()`、`onFileSelected()`、`sendFile()`、`retryFileTransfer()` 只检查 Chat WS 状态
+- `getPeerEndpoint()` 在已连接时使用历史联系人缓存的 IP/端口，避免 UDP 条目消失后文件上传找不到地址
+- `autoReconnect()` 可从联系人缓存读取地址，不再要求对方必须仍在 UDP 在线列表
+
+**后端同步修复**（`main.py`）：
+- 新增 `_contact_list_status()`：`active_chats` 中存在连接时返回 `online`，否则才参考 UDP peer list
+- `/api/contacts` 与 control WS 的 `init` 联系人状态统一调用该函数
+- `_notify_peer_offline()` 在仍有 Chat WS 时记录日志并忽略 UDP 离线事件
+
+**最终状态模型**：
+1. UDP 只维护“当前局域网是否可发现”，供未连接时展示在线节点和发起连接
+2. Chat WS 建立后，文字、文件、连接状态均只依赖 TCP/WS
+3. 只有 WS 真正关闭或用户主动断开，才清理 `activeChats` / `connectedPeers`
+
+---
+
+### 35. 跨平台真实网卡与子网枚举修复（2026-08-13）
+
+**问题**：
+- Linux 将 `socket.if_nameindex()` 的 `(index, name)` 错写成 `(name, index)`，导致 ioctl 收到整数而不能读取网卡
+- Windows/兜底逻辑按固定 `/24` 推算广播地址，在真实 `/16` 网络中会把同网段节点误判为不同子网
+- 多网卡设备可能选中 WSL、VPN、VMware 等虚拟地址，广播包携带的 IP 无法回连
+- 缺少结构化日志，跨主机测试时无法判断程序实际选择了哪张网卡
+
+**修复**（`discovery.py`）：
+- 新增 `NetworkInterface` 数据类，统一保存 `name`、`ip`、`netmask`、`network`、`broadcast`
+- 使用 `ipaddress.IPv4Interface` 根据真实掩码计算 network 和定向广播地址
+- Linux 改为 `for _, iface_name in socket.if_nameindex()`，通过 ioctl 获取 IP/掩码
+- Windows 使用 PowerShell `Get-NetIPAddress -AddressFamily IPv4` 并解析 JSON
+- 系统枚举失败时才使用 `getaddrinfo` + `/24` 兜底
+- 增加 `LANCHAT_BIND_IP`，允许测试时明确绑定目标物理/虚拟网卡
+- 网卡枚举结果缓存 60 秒，避免每次心跳都执行系统命令
+
+**修复**（`main.py`）：
+- `get_local_ip()` 优先读取 `LANCHAT_BIND_IP`，并复用 `get_network_interfaces()` 的跨平台结果
+- `NETWORK_SEGMENT` 使用选中网卡的真实 network，不再拼接固定 `/24`
+- 增加统一日志格式和 `LANCHAT_LOG_LEVEL`
+- 记录本机 IP/网段、枚举网卡、广播目标、HTTP Token 验证、联系人探活及 Chat WS 生命周期
+
+**回归测试**（`test_discovery.py`）：
+- 验证 `10.45.41.126/16` 与 `10.45.35.86` 被判断为同一子网
+- 验证 `10.45.35.86/16` 的 network 为 `10.45.0.0/16`，broadcast 为 `10.45.255.255`
+
+验证命令：
+```bash
+uv run python -m unittest test_discovery.py -v
+```
+
+---
+
+### 36. UDP 心跳与 Token 刷新解耦（2026-08-13）
+
+**问题**：原先 `TokenManager` 直接使用 `HEARTBEAT_INTERVAL` 判断是否刷新 Token。为了提高 UDP 发现速度而缩短心跳间隔时，Token 也会同步快速变化，导致建立连接时更容易拿到刚过期的 Token。
+
+**修复**（`discovery.py`）：
+```python
+HEARTBEAT_INTERVAL = 0.8
+TOKEN_REFRESH_INTERVAL = 3
+```
+
+- UDP 广播线程每 `0.8s` 发送心跳，提高局域网节点发现和恢复速度
+- `TokenManager.get_token()` 每 `3s` 才刷新 Token，保持认证窗口稳定
+- 心跳负责“发现”，Token 负责“连接前认证”，两者不再共用一个时间常量
+
+**效果**：缩短 UDP 发现延迟的同时，不会因为 Token 每 `0.8s` 变化而增加连接认证失败概率；Chat WS 建立后也不再依赖后续 UDP 心跳或 Token 更新。

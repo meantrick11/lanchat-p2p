@@ -1,0 +1,989 @@
+
+/**
+ * LanChat åç«¯äº¤äºé»è¾ã
+ *
+ * å¨å±ç¶æ:
+ *   myInfo       - æ¬æºä¿¡æ¯ {uuid, name, ip, network, ws_port}
+ *   onlinePeers  - å¨çº¿èç¹ Map<uuid, {name, ip}>
+ *   contacts     - åå²èç³»äºº Map<uuid, {name, ip, status, messages[]}>
+ *   pendingReqs  - å¾å¤çè¿æ¥è¯·æ± Map<uuid, {name}>
+ *   activeChats  - æ´»è·èå¤© WS Map<uuid, WebSocket>
+ *   currentChat  - å½åæ¾ç¤ºçèå¤© uuid | null
+ *   pendingMsgs  - å¾ç¡®è®¤æ¶æ¯ Map<msg_id, {content, uuid, timestamp}>
+ */
+
+// ===== å¨å±ç¶æ =====
+let myInfo = null;
+let onlinePeers = new Map();
+let contacts = new Map();
+let pendingRequests = new Map();
+let activeChats = new Map();
+let currentChat = null;
+let pendingMessages = new Map();
+let controlWs = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+
+// ===== DOM å¼ç¨ =====
+const $ = (id) => document.getElementById(id);
+const onlineList = $('online-list');
+const onlineCount = $('online-count');
+const pendingList = $('pending-list');
+const pendingCount = $('pending-count');
+const panelPending = $('panel-pending');
+const contactsList = $('contacts-list');
+const contactsCount = $('contacts-count');
+const chatPlaceholder = $('chat-placeholder');
+const chatContainer = $('chat-container');
+const chatPeerName = $('chat-peer-name');
+const chatPeerStatus = $('chat-peer-status');
+const chatMessages = $('chat-messages');
+const msgInput = $('msg-input');
+const btnSend = $('btn-send');
+const btnSendFile = $('btn-send-file');
+const fileInput = $('file-input');
+const btnCloseChat = $('btn-close-chat');
+const btnDeleteContact = $('btn-delete-contact');
+const btnScan = $('btn-scan');
+const btnEditName = $('btn-edit-name');
+const modalOverlay = $('modal-overlay');
+const modalNameInput = $('modal-name-input');
+const fileModalOverlay = $('file-modal-overlay');
+const fileModalTitle = $('file-modal-title');
+const fileModalBody = $('file-modal-body');
+const fileModalButtons = $('file-modal-buttons');
+
+// ===== åå§å =====
+async function init() {
+    await connectControl();
+    bindEvents();
+    startPolling();
+}
+
+/** è¿æ¥æ§å¶ WebSocket */
+async function connectControl() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${protocol}//${location.host}/ws/control`;
+
+    return new Promise((resolve) => {
+        controlWs = new WebSocket(url);
+
+        controlWs.onopen = () => {
+            reconnectAttempts = 0;
+            console.log('[Control] å·²è¿æ¥');
+        };
+
+        controlWs.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            handleControlMessage(msg);
+            if (msg.type === 'init') resolve();
+        };
+
+        controlWs.onclose = () => {
+            console.log('[Control] æ­å¼ï¼å°è¯éè¿...');
+            scheduleReconnect();
+        };
+
+        controlWs.onerror = () => {};
+    });
+}
+
+/** æ§å¶ WS æ­å¼åææ°éé¿éè¿ */
+function scheduleReconnect() {
+    if (reconnectTimer) return;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    const jitter = delay * (0.8 + Math.random() * 0.4);
+    reconnectAttempts++;
+    reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null;
+        await connectControl();
+    }, jitter);
+}
+
+// ===== äºä»¶ç»å® =====
+function bindEvents() {
+    btnScan.addEventListener('click', () => fetchPeers());
+    btnEditName.addEventListener('click', showEditNameModal);
+    $('btn-modal-cancel').addEventListener('click', hideEditNameModal);
+    $('btn-modal-save').addEventListener('click', saveName);
+    modalNameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveName();
+    });
+    btnSend.addEventListener('click', sendCurrentMessage);
+    msgInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') sendCurrentMessage();
+    });
+    btnSendFile.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', onFileSelected);
+    btnCloseChat.addEventListener('click', closeCurrentChat);
+    btnDeleteContact.addEventListener('click', deleteCurrentContact);
+}
+
+// ===== å®æ¶è½®è¯¢ =====
+function startPolling() {
+    // å¨çº¿ç¨æ·ï¼æ¯3ç§èªå¨å·æ°ï¼"æ«æ"æé®å¯æå¨ç«å³å·æ°
+    setInterval(fetchPeers, 3000);
+    // åå²èç³»äººå¨çº¿ç¶æï¼æ¯5ç§ä»åç«¯æåï¼åç«¯å·²åå¹¶UDPåç°çå¨çº¿ä¿¡æ¯ï¼
+    setInterval(fetchContacts, 5000);
+    fetchPeers();
+    fetchContacts();
+}
+
+/** å·æ°å½åå¨çº¿ç¨æ·åè¡¨ */
+async function fetchPeers() {
+    try {
+        const resp = await fetch('/api/peers');
+        const peers = await resp.json();
+        updateOnlinePeers(peers);
+    } catch (e) { /* ignore */ }
+}
+
+async function fetchContacts() {
+    try {
+        const resp = await fetch('/api/contacts');
+        const list = await resp.json();
+        updateContacts(list);
+    } catch (e) { /* ignore */ }
+}
+
+// ===== æ§å¶æ¶æ¯å¤ç =====
+function handleControlMessage(msg) {
+    const handlers = {
+        init: handleInit,
+        peer_online: handlePeerOnline,
+        peer_offline: handlePeerOffline,
+        incoming_connection: handleIncomingConnection,
+        pending_update: handlePendingUpdate,
+        connection_established: handleConnectionEstablished,
+        peer_disconnected: handlePeerDisconnected,
+        chat_message: handleIncomingMessage,
+        message_ack: handleMessageAck,
+        send_failed: handleSendFailed,
+        incoming_file_request: handleIncomingFileRequest,
+        file_request_response: handleFileRequestResponse,
+        transfer_progress: handleTransferProgress,
+        transfer_complete: handleTransferComplete,
+        transfer_cancelled: handleTransferCancelled,
+    };
+    const handler = handlers[msg.type];
+    if (handler) handler(msg);
+}
+
+function handleInit(msg) {
+    myInfo = msg;
+    $('my-name-label').textContent = msg.name;
+    $('my-ip-label').textContent = `IP: ${msg.ip}`;
+    $('my-network-label').textContent = `ç½æ®µ: ${msg.network}`;
+
+    // å è½½åå²èç³»äººï¼init æ¶æ¯ä¸­å·²å¸¦å¨çº¿/ç¦»çº¿ç¶æï¼
+    if (msg.contacts && msg.contacts.length > 0) {
+        updateContacts(msg.contacts);
+    }
+}
+
+function handlePeerOnline(msg) {
+    // æ´æ°å¨çº¿ç¨æ·é¢æ¿ï¼å¦ææ¾ç¤ºäºçè¯ï¼
+    onlinePeers.set(msg.uuid, { name: msg.name, ip: msg.ip, ws_port: msg.ws_port, token: msg.token });
+    // åæ­¥æ´æ°åå²èç³»äººçå¨çº¿ç¶æ
+    if (contacts.has(msg.uuid)) {
+        contacts.get(msg.uuid).status = 'online';
+    }
+    renderOnlineList();
+    renderContactsList();
+    updateChatHeaderStatus();
+}
+
+function handlePeerOffline(msg) {
+    onlinePeers.delete(msg.uuid);
+    // åæ­¥æ´æ°åå²èç³»äººçç¦»çº¿ç¶æ
+    if (contacts.has(msg.uuid)) {
+        contacts.get(msg.uuid).status = 'offline';
+    }
+    // å¯¹åºèå¤© WS æ­å¼
+    const ws = activeChats.get(msg.uuid);
+    if (ws) {
+        ws.close();
+        activeChats.delete(msg.uuid);
+    }
+    renderOnlineList();
+    renderContactsList();
+    updateChatHeaderStatus();
+    addSystemMessage(msg.uuid, `${msg.name} å·²ä¸çº¿`);
+}
+
+function handleIncomingConnection(msg) {
+    // ä¿å­è¿æ¥è¯·æ±ä¿¡æ¯ï¼åæ¬ IP åç«¯å£ï¼ä»¥ä¾¿åæåååå»ºç«è¿æ¥
+    pendingRequests.set(msg.uuid, { name: msg.name, ip: msg.ip, ws_port: msg.ws_port });
+    renderPendingList();
+}
+
+function handlePendingUpdate(msg) {
+    // county å¯è½å¨ pending åè¡¨è¢«å¶ä»å°æ¹ä¿®æ¹åæ¨é
+    if (msg.count === 0) pendingRequests.clear();
+}
+
+function handleConnectionEstablished(msg) {
+    pendingRequests.delete(msg.uuid);
+    // å å¥èç³»äºº
+    contacts.set(msg.uuid, {
+        name: msg.name,
+        ip: msg.ip,
+        status: 'online',
+        messages: [],
+    });
+    renderPendingList();
+    renderContactsList();
+    // å¦ææ­£å¨ç­å¯¹æ¹çç¡®è®¤ï¼ä¸»å¨åèµ·æ¹ï¼ï¼æå¼èå¤©
+    if (currentChat === msg.uuid || !currentChat) {
+        openChat(msg.uuid);
+    }
+}
+
+function handlePeerDisconnected(msg) {
+    activeChats.delete(msg.uuid);
+    pendingRequests.delete(msg.uuid);
+    renderPendingList();
+    if (currentChat === msg.uuid) {
+        updateChatHeaderStatus();
+        addSystemMessage(msg.uuid, `${msg.name || 'å¯¹æ¹'} å·²æ­å¼è¿æ¥`);
+    }
+}
+
+function handleIncomingMessage(msg) {
+    const uuid = msg.from;
+    // ä¿å­æ¶æ¯å°èç³»äºº
+    if (!contacts.has(uuid)) {
+        contacts.set(uuid, { name: msg.from_name, ip: '', status: 'online', messages: [] });
+    }
+    const contact = contacts.get(uuid);
+    contact.messages.push({
+        from: uuid,
+        content: msg.content,
+        msg_id: msg.msg_id,
+        timestamp: msg.timestamp,
+    });
+    if (currentChat === uuid) {
+        renderMessages(uuid);
+    }
+    // å½åæ²¡æèå¤©çªå£æ¶ï¼èªå¨æå¼
+    if (!currentChat) {
+        openChat(uuid);
+    }
+    renderContactsList();
+}
+
+function handleMessageAck(msg) {
+    pendingMessages.delete(msg.msg_id);
+    if (currentChat) renderMessages(currentChat);
+}
+
+function handleSendFailed(msg) {
+    // æ è®°æ¶æ¯åéå¤±è´¥
+    const pending = pendingMessages.get(msg.msg_id);
+    if (pending) {
+        pending.status = 'failed';
+        pendingMessages.set(msg.msg_id, pending);
+    }
+    if (currentChat) renderMessages(currentChat);
+}
+
+// ===== æä»¶ä¼ è¾æ¶æ¯å¤ç =====
+
+function handleIncomingFileRequest(msg) {
+    showFileRequestModal(msg);
+}
+
+function handleFileRequestResponse(msg) {
+    if (msg.accepted) {
+        console.log(`[Transfer] å¯¹æ¹æ¥åä¼ è¾: ${msg.transfer_id}`);
+    } else {
+        showToast('å¯¹æ¹æç»äºæä»¶ä¼ è¾');
+    }
+}
+
+function handleTransferProgress(msg) {
+    // æ´æ°ä¼ è¾è¿åº¦ï¼å¯å¨èå¤©åºæä¾§è¾¹æ å±ç¤ºè¿åº¦æ¡ï¼
+    console.log(`[Transfer] è¿åº¦: ${msg.received_bytes}/${msg.total_bytes}`);
+}
+
+function handleTransferComplete(msg) {
+    showToast(`æä»¶æ¥æ¶å®æ: ${msg.file_name}`);
+    addSystemMessage(currentChat, `æä»¶ ${msg.file_name} æ¥æ¶å®æ â`);
+}
+
+function handleTransferCancelled(msg) {
+    showToast('å¯¹æ¹åæ¶äºæä»¶ä¼ è¾');
+    addSystemMessage(currentChat, 'æä»¶ä¼ è¾å·²åæ¶');
+}
+
+// ===== å¨çº¿åè¡¨æ¸²æ =====
+function updateOnlinePeers(peers) {
+    onlinePeers.clear();
+    for (const p of peers) {
+        onlinePeers.set(p.uuid, { name: p.name, ip: p.ip, ws_port: p.ws_port, token: p.token });
+    }
+    // åªå·æ°å¨çº¿ç¨æ·é¢æ¿ï¼èç³»äººçå¨çº¿ç¶æç± contacts Map ä¸­ç status å­æ®µç®¡
+    renderOnlineList();
+}
+
+function renderOnlineList() {
+    onlineCount.textContent = onlinePeers.size;
+    if (onlinePeers.size === 0) {
+        onlineList.innerHTML = '<div class="empty-hint">ææ å¨çº¿ç¨æ·</div>';
+        return;
+    }
+    onlineList.innerHTML = '';
+    for (const [uuid, peer] of onlinePeers) {
+        const div = document.createElement('div');
+        div.className = `item${currentChat === uuid ? ' active' : ''}`;
+        div.innerHTML = `
+            <span class="dot online"></span>
+            <div class="info">
+                <div class="name">${esc(peer.name)}</div>
+                <div class="sub">${esc(peer.ip)}</div>
+            </div>`;
+        div.addEventListener('click', () => connectToPeer(uuid, peer.name, peer.ip));
+        onlineList.appendChild(div);
+    }
+}
+
+// ===== å¾å¤çè¯·æ±åè¡¨æ¸²æ =====
+function renderPendingList() {
+    if (pendingRequests.size === 0) {
+        panelPending.style.display = 'none';
+        return;
+    }
+    panelPending.style.display = '';
+    pendingCount.textContent = pendingRequests.size;
+    pendingList.innerHTML = '';
+    for (const [uuid, req] of pendingRequests) {
+        const div = document.createElement('div');
+        div.className = 'item';
+        div.innerHTML = `
+            <span class="dot pending"></span>
+            <div class="info"><div class="name">${esc(req.name)}</div></div>
+            <div class="actions">
+                <button class="btn-accept" data-uuid="${uuid}">åæ</button>
+                <button class="btn-reject" data-uuid="${uuid}">æç»</button>
+            </div>`;
+        div.querySelector('.btn-accept').addEventListener('click', (e) => {
+            e.stopPropagation();
+            respondConnection(uuid, true);
+        });
+        div.querySelector('.btn-reject').addEventListener('click', (e) => {
+            e.stopPropagation();
+            respondConnection(uuid, false);
+        });
+        pendingList.appendChild(div);
+    }
+}
+
+async function respondConnection(uuid, accepted) {
+    controlWs.send(JSON.stringify({
+        type: 'connection_response',
+        to_uuid: uuid,
+        accepted: accepted,
+    }));
+    pendingRequests.delete(uuid);
+    renderPendingList();
+    if (accepted) {
+        // ä¿å­èç³»äººä¿¡æ¯å¹¶æå¼èå¤©çªå£
+        // æ³¨æï¼æ¶æ¯åéèµ° AâBåç«¯ç chat WSï¼ååï¼ï¼BâA èµ° Båç«¯ç active_chats[A] åä¼ å
+ä¸ WS
+        const peer = onlinePeers.get(uuid) || { name: 'Unknown', ip: '' };
+        contacts.set(uuid, { name: peer.name, ip: peer.ip, status: 'online', messages: [] });
+        openChat(uuid);
+    }
+}
+
+// ===== åå²èç³»äººåè¡¨æ¸²æ =====
+function updateContacts(list) {
+    for (const c of list) {
+        if (!contacts.has(c.uuid)) {
+            contacts.set(c.uuid, {
+                name: c.name,
+                ip: c.ip,
+                status: c.status,
+                messages: [],
+            });
+        } else {
+            contacts.get(c.uuid).status = c.status;
+            contacts.get(c.uuid).name = c.name || contacts.get(c.uuid).name;
+            contacts.get(c.uuid).ip = c.ip || contacts.get(c.uuid).ip;
+        }
+    }
+    renderContactsList();
+    updateChatHeaderStatus();
+}
+
+function renderContactsList() {
+    const list = Array.from(contacts.entries())
+        .sort((a, b) => {
+            // å¨çº¿æåé¢ï¼åç¶ææåå­æåº
+            if (a[1].status !== b[1].status) return a[1].status === 'online' ? -1 : 1;
+            return a[1].name.localeCompare(b[1].name);
+        });
+
+    contactsCount.textContent = list.length;
+    if (list.length === 0) {
+        contactsList.innerHTML = '<div class="empty-hint">ææ åå²èç³»äºº</div>';
+        return;
+    }
+
+    contactsList.innerHTML = '';
+    for (const [uuid, contact] of list) {
+        const div = document.createElement('div');
+        div.className = `item${currentChat === uuid ? ' active' : ''}`;
+        // ç¨èç³»äººèªèº«ç status å­æ®µï¼ç± fetchContacts æ¯5ç§æ´æ°ï¼init æ¶æ¯ä¹æåå§å¼ï¼
+        const isOnline = contact.status === 'online';
+        const dotClass = isOnline ? 'online' : 'offline';
+        const statusText = isOnline ? '' : ' (ç¦»çº¿)';
+        div.innerHTML = `
+            <span class="dot ${dotClass}"></span>
+            <div class="info">
+                <div class="name">${esc(contact.name)}${statusText}</div>
+                <div class="sub">${esc(contact.ip)}</div>
+            </div>`;
+        div.addEventListener('click', async () => {
+            if (isOnline) {
+                // å¨çº¿ â ç¡®ä¿ onlinePeers æå®æ´ä¿¡æ¯ï¼ç¶åè¿æ¥
+                if (!onlinePeers.has(uuid)) {
+                    await fetchPeers(); // æåå¨çº¿åè¡¨è·å ws_port/token
+                }
+                if (onlinePeers.has(uuid)) {
+                    connectToPeer(uuid, contact.name, contact.ip);
+                } else {
+                    // æååä»ä¸å¨çº¿ï¼è¯´æå¯¹æ¹åå¥½ä¸çº¿
+                    showToast('å¯¹æ¹ä¸å¨çº¿');
+                    openChat(uuid);
+                }
+            } else {
+                // ç¦»çº¿ â æç¤ºç¨æ·ï¼å è½½åå²èå¤©è®°å½
+                showToast('å¯¹æ¹ä¸å¨çº¿');
+                openChat(uuid);
+            }
+        });
+        // å³é®å é¤
+        div.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            if (confirm(`ç¡®å®å é¤èç³»äºº ${contact.name} åèå¤©è®°å½ï¼`)) {
+                deleteContact(uuid);
+            }
+        });
+        contactsList.appendChild(div);
+    }
+}
+
+async function deleteContact(uuid) {
+    try {
+        await fetch(`/api/contacts/${uuid}`, { method: 'DELETE' });
+    } catch (e) { /* ignore */ }
+    contacts.delete(uuid);
+    if (currentChat === uuid) closeCurrentChat();
+    renderContactsList();
+}
+
+// ===== è¿æ¥å¯¹ç«¯ / æå¼èå¤© =====
+
+/**
+ * ä¸»å¨åèµ·ä¸å¯¹ç«¯ç WebSocket è¿æ¥ã
+ * æµç¨: è¿æ¥ ws://peer_ip:ws_port/ws/chat â å connect_requestï¼å¸¦ tokenï¼â ç­ connect_accepted
+ */
+async function connectToPeer(uuid, name, ip) {
+    // å¦æå·²ææ´»è·è¿æ¥ï¼ç´æ¥æå¼èå¤©
+    if (activeChats.has(uuid)) {
+        openChat(uuid);
+        return;
+    }
+
+    // è·åå¯¹ç«¯ ws_portï¼ä»å¨çº¿èç¹åè¡¨ï¼
+    const peer = onlinePeers.get(uuid);
+    if (!peer) {
+        showToast('å¯¹æ¹ä¸å¨çº¿');
+        return;
+    }
+
+    openChat(uuid); // åæå¼èå¤©çªå£ï¼æ¾ç¤º"è¿æ¥ä¸­..."
+
+    // è¿æ¥ååå·æ°èªå·±ç tokenï¼token æ¯3ç§æ´æ°ï¼é¿åç¨è¿æçï¼
+    try {
+        const resp = await fetch('/api/me');
+        const me = await resp.json();
+        myInfo.token = me.token;
+    } catch (e) { /* å·æ°å¤±è´¥åç¨ç°æ token */ }
+
+    try {
+        const peerPort = peer.ws_port || 50002;
+        const wsUrl = `ws://${peer.ip}:${peerPort}/ws/chat`;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            // åéè¿æ¥è¯·æ±ï¼å¸¦ä¸èªå·±ç token ç»å¯¹æ¹åç«¯éªè¯
+            // å¯¹æ¹éè¿ UDP å¹¿æ­æ¶å°äºæç tokenï¼éªè¯æ¯å¦å¹é
+            ws.send(JSON.stringify({
+                type: 'connect_request',
+                uuid: myInfo.uuid,
+                name: myInfo.name,
+                token: myInfo.token,
+            }));
+        };
+
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'connect_accepted') {
+                activeChats.set(uuid, ws);
+                setupPeerMessageHandler(uuid, ws);
+                addSystemMessage(uuid, 'è¿æ¥å·²å»ºç«');
+                // éç¥èªå·±åç«¯ä¿å­èç³»äººï¼å¯¹æ¹åç«¯å·²ä¿å­ï¼èªå·±åç«¯ä¹éè¦è®°å½ï¼
+                controlWs.send(JSON.stringify({
+                    type: 'save_contact',
+                    uuid: uuid,
+                    name: name,
+                    ip: ip,
+                }));
+            } else if (msg.type === 'connect_rejected') {
+                ws.close();
+                const reason = msg.reason === 'invalid_token' ? 'Token éªè¯å¤±è´¥ï¼è¯·ç¨åéè¯' : 'å¯¹æ¹æç»ä
+ºè¿æ¥è¯·æ±';
+                addSystemMessage(uuid, reason);
+                showToast(reason);
+            }
+        };
+
+        ws.onclose = () => {
+            activeChats.delete(uuid);
+            if (currentChat === uuid) {
+                addSystemMessage(uuid, 'è¿æ¥å·²æ­å¼');
+                updateChatHeaderStatus();
+            }
+        };
+
+        ws.onerror = () => {
+            activeChats.delete(uuid);
+            addSystemMessage(uuid, 'è¿æ¥å¤±è´¥ï¼è¯·æ£æ¥ç½ç»');
+            showToast('è¿æ¥å¤±è´¥');
+            ws.close();
+        };
+
+    } catch (e) {
+        addSystemMessage(uuid, `è¿æ¥å¤±è´¥: ${e.message}`);
+    }
+}
+
+/** ä¸ºå¯¹ç«¯ WS è®¾ç½®æ¶æ¯å¤çå¨ï¼æ¶å° connect_accepted åè°ç¨ï¼ */
+function setupPeerMessageHandler(uuid, ws) {
+    ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'chat') {
+            // å¯¹æ¹åæ¥çèå¤©æ¶æ¯ï¼ç´æ¥ä» ws æ¶å°æ¶ä¹éè¦å¤çï¼
+            handleDirectChatMessage(uuid, msg);
+        } else if (msg.type === 'file_response') {
+            handleFileRequestResponse(msg);
+        } else if (msg.type === 'file_cancel') {
+            handleTransferCancelled(msg);
+        } else if (msg.type === 'ack') {
+            handleMessageAck(msg);
+        }
+    };
+}
+
+function handleDirectChatMessage(uuid, msg) {
+    if (!contacts.has(uuid)) {
+        contacts.set(uuid, { name: msg.from_name, ip: '', status: 'online', messages: [] });
+    }
+    contacts.get(uuid).messages.push({
+        from: uuid,
+        content: msg.content,
+        msg_id: msg.msg_id,
+        timestamp: msg.timestamp,
+    });
+    // chat WS ç´è¿ç»è¿èªå·±åç«¯ï¼éé¢å¤éç¥èªå·±åç«¯ä¿å­æ¶æ¯
+    controlWs.send(JSON.stringify({
+        type: 'save_message',
+        peer_uuid: uuid,
+        sender: uuid,
+        content: msg.content,
+        msg_id: msg.msg_id,
+    }));
+    if (currentChat === uuid) renderMessages(uuid);
+    renderContactsList();
+}
+
+async function openChat(uuid) {
+    currentChat = uuid;
+    chatPlaceholder.style.display = 'none';
+    chatContainer.style.display = '';
+
+    const contact = contacts.get(uuid) || { name: 'Unknown', ip: '', status: 'offline' };
+    chatPeerName.textContent = contact.name;
+    updateChatHeaderStatus();
+
+    // ä»åç«¯å è½½åå²æ¶æ¯ï¼é¦æ¬¡æå¼ææ¶æ¯ä¸ºç©ºæ¶å è½½ï¼
+    if (!contact.messages || contact.messages.length === 0) {
+        try {
+            const resp = await fetch(`/api/messages/${uuid}`);
+            const history = await resp.json();
+            if (!contacts.has(uuid)) {
+                contacts.set(uuid, { name: contact.name, ip: contact.ip, status: contact.status, messages: [] });
+            }
+            contacts.get(uuid).messages = history;
+        } catch (e) { /* å è½½å¤±è´¥åç¨ç°ææ¶æ¯ */ }
+    }
+
+    renderMessages(uuid);
+    renderOnlineList();
+    renderContactsList();
+}
+
+function closeCurrentChat() {
+    currentChat = null;
+    chatPlaceholder.style.display = '';
+    chatContainer.style.display = 'none';
+    chatMessages.innerHTML = '';
+    renderOnlineList();
+    renderContactsList();
+}
+
+function updateChatHeaderStatus() {
+    if (!currentChat) return;
+    const contact = contacts.get(currentChat);
+    const online = contact ? contact.status === 'online' : false;
+    chatPeerStatus.textContent = online ? 'ð¢ å¨çº¿' : 'ð´ ç¦»çº¿';
+    chatPeerStatus.className = online ? 'online' : 'offline';
+    msgInput.disabled = !online;
+    btnSend.disabled = !online;
+    btnSendFile.disabled = !online;
+}
+
+// ===== åéæ¶æ¯ =====
+function sendCurrentMessage() {
+    const content = msgInput.value.trim();
+    if (!content || !currentChat) return;
+    msgInput.value = '';
+
+    const msgId = generateMsgId();
+    const contact = contacts.get(currentChat);
+
+    // ä¿å­å°æ¬å°èç³»äººæ¶æ¯åè¡¨
+    if (!contact.messages) contact.messages = [];
+    contact.messages.push({
+        from: 'me',
+        content: content,
+        msg_id: msgId,
+        timestamp: new Date().toISOString(),
+        status: 'sending',
+    });
+    renderMessages(currentChat);
+
+    pendingMessages.set(msgId, { content, uuid: currentChat, status: 'sending' });
+
+    // å¤æ­åéè·¯å¾ï¼
+    //   - ä¸»å¨åèµ·æ¹ï¼æ chat WSï¼ç´æ¥è¿å¯¹æ¹åç«¯ /ws/chatï¼ï¼éè¿å®åé
+    //   - è¢«å¨æ¥æ¶æ¹ï¼æ²¡æ chat WSï¼éè¿ control WS åç»èªå·±åç«¯ï¼
+    //                 èªå·±åç«¯å¤ç¨åèµ·æ¹å»ºç«ç chat WS åä¼ ç»å¯¹æ¹
+    const chatWs = activeChats.get(currentChat);
+    if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+        chatWs.send(JSON.stringify({
+            type: 'chat',
+            msg_id: msgId,
+            content: content,
+        }));
+        // chat WS ç´è¿ç»è¿èªå·±åç«¯ï¼éé¢å¤éç¥èªå·±åç«¯ä¿å­æ¶æ¯
+        controlWs.send(JSON.stringify({
+            type: 'save_message',
+            peer_uuid: currentChat,
+            sender: 'me',
+            content: content,
+            msg_id: msgId,
+        }));
+    } else {
+        controlWs.send(JSON.stringify({
+            type: 'chat_message',
+            to_uuid: currentChat,
+            msg_id: msgId,
+            content: content,
+        }));
+    }
+
+    // 5ç§è¶æ¶ï¼æ²¡æ¶å° ACK åæ è®°å¤±è´¥
+    setTimeout(() => {
+        const pending = pendingMessages.get(msgId);
+        if (pending && pending.status === 'sending') {
+            pending.status = 'failed';
+            pendingMessages.set(msgId, pending);
+            if (currentChat) renderMessages(currentChat);
+        }
+    }, 5000);
+}
+
+// ===== èå¤©æ¶æ¯æ¸²æ =====
+function renderMessages(uuid) {
+    chatMessages.innerHTML = '';
+    const contact = contacts.get(uuid);
+    if (!contact || !contact.messages) return;
+
+    const items = contact.messages;
+    for (const m of items) {
+        const div = document.createElement('div');
+        if (m.from === 'me') {
+            div.className = 'msg sent';
+            const statusIcon = m.status === 'sending' ? 'ð' :
+                               m.status === 'failed' ? 'â ï¸' : 'â';
+            const statusClass = m.status === 'sending' ? 'status-sending' :
+                                m.status === 'failed' ? 'status-failed' : 'status-sent';
+            div.innerHTML = `${esc(m.content)}<div class="time">${fmtTime(m.timestamp)} <span class="status ${statusCla
+ss}">${statusIcon}</span></div>`;
+        } else {
+            div.className = 'msg received';
+            div.innerHTML = `${esc(m.content)}<div class="time">${fmtTime(m.timestamp)}</div>`;
+        }
+        chatMessages.appendChild(div);
+    }
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function addSystemMessage(uuid, text) {
+    if (!contacts.has(uuid)) return;
+    contacts.get(uuid).messages.push({
+        from: 'system',
+        content: text,
+        msg_id: generateMsgId(),
+        timestamp: new Date().toISOString(),
+    });
+    if (currentChat === uuid) renderMessages(uuid);
+}
+
+// ===== æä»¶ä¼ è¾ =====
+function onFileSelected() {
+    const file = fileInput.files[0];
+    fileInput.value = '';
+    if (!file || !currentChat) return;
+    sendFile(currentChat, file);
+}
+
+async function sendFile(uuid, file) {
+    const CHUNK_SIZE = 64 * 1024; // 64KB
+    const transferId = 't_' + myInfo.uuid + '_' + Date.now();
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+    // éè¿èå¤© WS å file_request
+    const ws = activeChats.get(uuid);
+    if (!ws) {
+        showToast('æªè¿æ¥å°å¯¹æ¹ï¼è¯·åå»ºç«èå¤©');
+        return;
+    }
+
+    ws.send(JSON.stringify({
+        type: 'file_request',
+        transfer_id: transferId,
+        file_name: file.name,
+        file_size: file.size,
+        chunk_size: CHUNK_SIZE,
+        total_chunks: totalChunks,
+        resume: false,
+    }));
+
+    // ç­å¾ file_responseï¼éè¿ control ws åè°ç»§ç»­ï¼
+    addSystemMessage(uuid, `åéæä»¶: ${file.name} (${formatSize(file.size)})`);
+
+    // å¼å§åéåç
+    window._pendingFileTransfers = window._pendingFileTransfers || {};
+    window._pendingFileTransfers[transferId] = { file, uuid, totalChunks, CHUNK_SIZE, transferId, currentChunk: 0 };
+
+    // ç­å¾å¯¹æ¹ååºåå¼å§åéåç
+    const originalHandler = handleFileRequestResponse;
+    const onceHandler = (msg) => {
+        if (msg.transfer_id === transferId) {
+            if (msg.accepted) {
+                startChunkUpload(transferId);
+            }
+            // æ¢å¤åå§å¤çå¨
+            window._fileResponseHandler = originalHandler;
+        }
+    };
+    window._fileResponseHandler = (msg) => {
+        originalHandler(msg);
+        onceHandler(msg);
+    };
+}
+
+function handleFileRequestResponse(msg) {
+    if (window._fileResponseHandler) {
+        window._fileResponseHandler(msg);
+    } else if (msg.accepted) {
+        // æ¥æ¾å¹éçä¼ è¾å¹¶å¼å§ä¸ä¼ 
+        const transfers = window._pendingFileTransfers || {};
+        for (const [tid, t] of Object.entries(transfers)) {
+            if (!t.started) {
+                t.started = true;
+                startChunkUpload(tid);
+                break;
+            }
+        }
+    }
+}
+
+async function startChunkUpload(transferId) {
+    const t = window._pendingFileTransfers?.[transferId];
+    if (!t) return;
+
+    const peer = onlinePeers.get(t.uuid);
+    if (!peer) {
+        showToast('å¯¹æ¹ä¸å¨çº¿ï¼æ æ³åéæä»¶');
+        return;
+    }
+
+    const file = t.file;
+    const CHUNK_SIZE = t.CHUNK_SIZE;
+    const totalChunks = t.totalChunks;
+
+    for (let i = t.currentChunk; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const blob = file.slice(start, end);
+        const dataB64 = await readAsBase64(blob);
+
+        let retries = 0;
+        let success = false;
+
+        while (retries < 3 && !success) {
+            try {
+                const peerPort = peer.ws_port || 50002;
+            const resp = await fetch(`http://${peer.ip}:${peerPort}/api/transfer/chunk`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        transfer_id: transferId,
+                        chunk_index: i,
+                        data: dataB64,
+                    }),
+                });
+                if (resp.ok) {
+                    success = true;
+                    t.currentChunk = i + 1;
+                } else {
+                    retries++;
+                }
+            } catch (e) {
+                retries++;
+            }
+        }
+
+        if (!success) {
+            addSystemMessage(t.uuid, 'æä»¶ä¼ è¾ä¸­æ­ï¼ç­å¾å¯¹æ¹éæ°ä¸çº¿');
+            return; // ä¼ è¾æåï¼ç­å¾åç»­ç»­ä¼ 
+        }
+    }
+
+    // å®æ
+    try {
+        const peerPort = peer.ws_port || 50002;
+        await fetch(`http://${peer.ip}:${peerPort}/api/transfer/complete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transfer_id: transferId }),
+        });
+        addSystemMessage(t.uuid, `æä»¶ ${file.name} åéå®æ â`);
+    } catch (e) {
+        addSystemMessage(t.uuid, 'æä»¶ä¼ è¾å®æç¡®è®¤å¤±è´¥');
+    }
+
+    delete window._pendingFileTransfers?.[transferId];
+}
+
+function readAsBase64(blob) {
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const result = reader.result;
+            // å»æ "data:...;base64," åç¼
+            const b64 = result.split(',')[1] || result;
+            resolve(b64);
+        };
+        reader.readAsDataURL(blob);
+    });
+}
+
+// ===== æä»¶ä¼ è¾å¼¹çª =====
+function showFileRequestModal(msg) {
+    fileModalTitle.textContent = 'æä»¶ä¼ è¾è¯·æ±';
+    fileModalBody.innerHTML = `
+        <p><strong>${esc(msg.from_name)}</strong> æ³åéæä»¶:</p>
+        <p>ð ${esc(msg.file_name)} (${formatSize(msg.file_size)})</p>`;
+    fileModalButtons.innerHTML = `
+        <button id="btn-file-accept" class="btn-primary">æ¥æ¶</button>
+        <button id="btn-file-reject">æç»</button>`;
+    fileModalOverlay.style.display = '';
+
+    $('btn-file-accept').addEventListener('click', () => {
+        controlWs.send(JSON.stringify({
+            type: 'file_response',
+            transfer_id: msg.transfer_id,
+            accepted: true,
+        }));
+        fileModalOverlay.style.display = 'none';
+    });
+    $('btn-file-reject').addEventListener('click', () => {
+        controlWs.send(JSON.stringify({
+            type: 'file_response',
+            transfer_id: msg.transfer_id,
+            accepted: false,
+        }));
+        fileModalOverlay.style.display = 'none';
+    });
+}
+
+// ===== æµç§°ç¼è¾å¼¹çª =====
+function showEditNameModal() {
+    modalNameInput.value = myInfo.name;
+    modalOverlay.style.display = '';
+    modalNameInput.focus();
+}
+function hideEditNameModal() {
+    modalOverlay.style.display = 'none';
+}
+function saveName() {
+    const newName = modalNameInput.value.trim();
+    if (!newName || newName === myInfo.name) {
+        hideEditNameModal();
+        return;
+    }
+    controlWs.send(JSON.stringify({ type: 'update_name', name: newName }));
+    myInfo.name = newName;
+    $('my-name-label').textContent = newName;
+    hideEditNameModal();
+}
+
+// ===== å·¥å·å½æ° =====
+function generateMsgId() {
+    return 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+function esc(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+function fmtTime(ts) {
+    try {
+        const d = new Date(ts);
+        return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return ''; }
+}
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+}
+function showToast(text) {
+    // ç®åç toast æç¤º
+    const div = document.createElement('div');
+    div.style.cssText = 'position:fixed;top:60px;right:20px;background:#333;color:#fff;padding:10px 20px;border-radius:
+6px;z-index:200;font-size:13px;animation:fadeOut 2s forwards';
+    div.textContent = text;
+    document.body.appendChild(div);
+    setTimeout(() => div.remove(), 2200);
+}
+
+// ===== å¯å¨ =====
+init();
+

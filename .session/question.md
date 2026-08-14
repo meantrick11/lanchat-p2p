@@ -2,7 +2,7 @@
 
 ## 1. 发现机制：UDP 单连接 vs 全量发现？
 
-**决定**：全量发现。UDP 广播到 `255.255.255.255`，每个节点周期性发送心跳（每3秒），同时持续监听，每个节点都能发现局域网内所有在线节点。用户在列表中选择一个建立点对点通信。
+**决定**：全量发现。UDP 向每张活跃网卡的定向广播地址发送心跳（每 `0.8s`），同时持续监听，每个节点都能发现所在局域网内的在线节点。用户在列表中选择一个建立点对点通信。
 
 **原因**：UDP 广播天然是一对全的机制。
 
@@ -57,7 +57,7 @@
 ⑤ 此后整个会话不再验证
 ```
 
-**首次连接没有 token 怎么办**：启动时立即发第一次广播（不等3秒定时器），窗口缩到0秒。极端情况 UDP 丢包，前端等2秒重试。
+**首次连接没有 token 怎么办**：启动时立即发第一次广播（不等 `0.8s` 心跳定时器），窗口缩到0秒。极端情况 UDP 丢包，前端等2秒重试。
 
 ---
 
@@ -109,7 +109,9 @@
 **决定**：
 - FastAPI 绑定 `0.0.0.0`，监听所有网卡接口
 - UDP 遍历所有活跃网卡，每张网卡发出的广播包携带**该网卡自己的 IP**（非全局单一 IP），保证接收方拿到的地址在同子网内可达
-- Linux 通过 ioctl 获取网卡 IP + 子网掩码；Windows 通过 `ipconfig` 解析（适配中英文系统），必要时 `getaddrinfo` 兜底
+- Linux 通过 ioctl 获取网卡 IP + 真实子网掩码；Windows 通过 PowerShell `Get-NetIPAddress` 的 JSON 结果枚举，必要时 `getaddrinfo` 兜底
+- 使用真实掩码计算 network 和定向广播地址，不再固定按 `/24` 推算
+- 可通过 `LANCHAT_BIND_IP` 明确绑定目标网卡
 - 网卡枚举结果缓存 60 秒
 - UDP 监听绑定 `0.0.0.0`，可收到所有网卡回复
 - 只支持同子网发现，不跨路由器
@@ -123,7 +125,7 @@
 - **发现**：UDP 广播只覆盖同子网，跨子网需手动输入 IP:端口
 - **验证**：跨子网时 UDP peer_list 没有对方记录 → HTTP GET `/api/me` 反向验证 token
 - **持久化**：联系人存储 `ws_port`，重启后通过定期 HTTP 探活（每 30 秒）自动发现上线状态
-- **续活**：HTTP 探活成功刷新 `last_seen`，防止 UDP 超时机制（16s）误踢跨子网节点
+- **续活**：HTTP 探活成功刷新 `last_seen`；Chat WS 建立后，连接状态不再受 UDP 超时影响
 - **限制**：需 TCP 可达，需知道对方 IP:端口，首次仍需手动输入
 
 ---
@@ -457,3 +459,55 @@ if get_contact(peer["uuid"]):
 - `storage.py`：`delete_contact` 改回完整删除（`del`）；移除 `get_deleted_uuids`；新增 `remove_deleted_tombstones()` 启动时清理 v32 遗留墓碑
 - `main.py`：`ws_chat` 判定改为 `if existing_contact and peer_has_me`；`/api/me` 移除 `deleted_uuids`
 - `app.js`：`connectToPeer`/`autoReconnect`/`connectByIp` 发送 `have_you`；`connectToPeer` 在 `openChat` **之前**取 `contacts.has(uuid)`（openChat 会把刚删的联系人从后端重新加回 Map，之后取会误判为 True）
+
+---
+
+## 41. UDP 发现状态与 Chat 连接状态如何划分？
+
+**决定**：将“UDP 可发现状态”和“Chat WebSocket 连接状态”拆成两套独立状态。UDP 只负责发现当前局域网内的节点，并为建立连接前的 Token 验证提供信息；Chat WebSocket 一旦建立，聊天是否可用只由 WebSocket 是否仍连接决定。
+
+**状态规则**：
+- **尚未建立 Chat WS**：根据 UDP `onlinePeers` 判断节点是否可发现，并决定是否显示“连接”按钮
+- **已经建立 Chat WS**：根据 `activeChats` / `connectedPeers` 判断连接状态；UDP 心跳超时、丢包或收不到广播都不能关闭连接、标记聊天离线或阻止消息和文件发送
+- **连接真正结束**：只由 `ws.onclose`、后端 `peer_disconnected`、用户主动断开等 TCP/WS 事件清理连接状态
+
+**原因**：UDP 不保证送达，跨子网、Windows 防火墙、虚拟网卡、Wi-Fi AP 隔离和临时丢包都可能造成误判。此时 TCP WebSocket 可能仍然完全正常，不能因为 UDP 暂时不可见就破坏已经建立的可靠会话。
+
+**实现**：
+- 前端新增 `isPeerConnected()`、`isPeerDiscoverable()` 和 `getPeerEndpoint()`，分别处理会话态、发现态和已连接时的缓存地址
+- `handlePeerOffline()` 只更新 UDP 在线列表；若 Chat WS 仍连接，不修改联系人连接状态、不提示“已下线”、不关闭 WS
+- 文字发送、文件发送和文件重传只检查 Chat WS 连接，不再额外依赖 `onlinePeers`
+- 后端 `_notify_peer_offline()` 在 `active_chats` 中仍有连接时忽略 UDP 离线通知
+- `/api/contacts` 和 control WS 的 `init` 数据优先合并 `active_chats` 状态，避免前端轮询把已连接联系人覆盖成离线
+
+---
+
+## 42. 多网卡环境如何准确判断真实子网？
+
+**决定**：不再固定按 `/24` 推算网段，而是枚举每张网卡的真实 IPv4 地址和掩码，用 `ipaddress.IPv4Interface` 计算 network 与 broadcast。
+
+**平台实现**：
+- Linux：修正 `socket.if_nameindex()` 的返回值顺序，使用第二项网卡名，再通过 ioctl 获取 IP 和真实掩码
+- Windows：通过 PowerShell `Get-NetIPAddress` 输出 JSON，避免依赖中英文 `ipconfig` 文本格式
+- 枚举失败：使用 `getaddrinfo` 兜底；兜底无法获得真实掩码时才保守使用 `/24`
+- 多网卡选择：支持环境变量 `LANCHAT_BIND_IP`，可明确指定 Wi-Fi、以太网、VMware Host-Only 等目标网卡
+
+**原因**：真实网络可能是 `/16`、`/20` 等网段。固定 `/24` 会把实际同网段节点误判为“非本地子网”，也会计算错误广播地址；多网卡时还可能把 VPN、WSL、VMware 地址当成主要局域网地址。
+
+**诊断策略**：启动时记录网卡名称、IP、network、broadcast，并记录 UDP 广播、Token 验证、HTTP 探活和 Chat WS 建立/断开信息。日志级别可通过 `LANCHAT_LOG_LEVEL` 调整。
+
+---
+
+## 43. UDP 心跳频率与 Token 刷新频率是否应该相同？
+
+**决定**：两者分离。UDP 心跳间隔为 `0.8s`，用于更快发现节点；Token 刷新间隔仍为 `3s`，用于保持合理的连接认证窗口。
+
+**原因**：心跳频率决定发现速度，Token 刷新频率决定认证数据的有效窗口，两者职责不同。若 Token 跟随 `0.8s` 心跳一起快速刷新，浏览器或对端使用刚收到的 Token 建立连接时更容易遇到 Token 已更新的问题。
+
+**实现**：
+```python
+HEARTBEAT_INTERVAL = 0.8
+TOKEN_REFRESH_INTERVAL = 3
+```
+
+`Discovery._broadcast_loop()` 使用 `HEARTBEAT_INTERVAL`，`TokenManager.get_token()` 使用 `TOKEN_REFRESH_INTERVAL`，互不影响。
