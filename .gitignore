@@ -15,3 +15,7 @@ uv.lock
 # 临时文件
 ~$*
 *.tmp
+
+CLAUDE.md
+
+test_discovery.py
